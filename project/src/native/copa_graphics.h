@@ -33,6 +33,8 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 
+#include "../pc_settings.h"
+
 namespace copa {
 
 using rex::X_STATUS;
@@ -186,7 +188,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       if (clock::now() >= next_vblank) {
         ++vblank_count_;
         Dispatch(0);
-        next_vblank += std::chrono::nanoseconds(int64_t(1e9 / refresh_hz_));
+        next_vblank += std::chrono::nanoseconds(int64_t(1e9 / pcs::GuestRefreshHz()));  // live setting
         if (clock::now() > next_vblank + std::chrono::milliseconds(100)) next_vblank = clock::now();
       }
     }
@@ -206,7 +208,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   std::atomic<uint64_t> vblank_count_{0};
   std::atomic<void (*)(void*)> poller_{nullptr};
   void* poller_context_ = nullptr;
-  double refresh_hz_ = 60.0;
+  double refresh_hz_ = pcs::GuestRefreshHz();
 };
 
 }  // namespace copa

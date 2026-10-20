@@ -14,5 +14,8 @@ inline pcs::GameInfo PcGameInfo() {
   info.language_count = int(sizeof(kLanguages) / sizeof(kLanguages[0]));
   info.internal_resolution = true;
   info.football_keyboard = true;
+  // Measured 2026-10-20 at a 120 Hz vblank with no limit: the match/drill clock keeps real time at
+  // 70-150 fps and the menus do not wait for the vblank, so frame rates above 60 are safe.
+  info.real_time = true;
   return info;
 }

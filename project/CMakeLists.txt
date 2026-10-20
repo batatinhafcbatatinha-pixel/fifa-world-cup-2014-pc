@@ -27,6 +27,7 @@ endif()
 set(COPA2014_SOURCES
     src/main.cpp
     src/kernel_extra.cpp
+    src/menu_hooks.cpp
     src/pc_settings.cpp
     src/native/d3d_hooks.cpp
     src/native/renderer.cpp
@@ -63,6 +64,13 @@ if(WIN32)
     target_compile_definitions(copa_shader_test PRIVATE NOMINMAX)
 endif()
 
+# Hooks on functions of the UI module must be compiled into that module.
+if(TARGET copa2014_powdllzf_xex)
+    target_sources(copa2014_powdllzf_xex PRIVATE src/pow_hooks.cpp src/pc_settings.cpp)
+    target_include_directories(copa2014_powdllzf_xex PRIVATE src src/native)
+    target_link_libraries(copa2014_powdllzf_xex PRIVATE d3d11 dxgi)
+endif()
+
 # DLL sources are emitted by the shared codegen command but are not listed as
 # outputs in the SDK's entrypoint-only rule. A normal dependency makes Ninja
 # recompile them after generation instead of shipping stale function tables.
@@ -73,3 +81,19 @@ foreach(module IN ITEMS FootballCompEngzf_xex powdllzf_xex)
             "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/codegen.build.stamp")
     endif()
 endforeach()
+
+# Vulkan option of the settings menu: DXVK's d3d11.dll/dxgi.dll in vulkan\ next to the
+# executable (pc_settings.cpp loads them by full path when "API grafica" is Vulkan).
+set(DXVK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/dxvk-3.1.1" CACHE PATH
+    "DXVK release for Windows (x64/d3d11.dll, x64/dxgi.dll, LICENSE)")
+if(WIN32 AND EXISTS "${DXVK_DIR}/x64/d3d11.dll")
+    add_custom_command(TARGET copa2014 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:copa2014>/vulkan"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/x64/d3d11.dll" "${DXVK_DIR}/x64/dxgi.dll"
+                "$<TARGET_FILE_DIR:copa2014>/vulkan/")
+    if(EXISTS "${DXVK_DIR}/LICENSE")
+        add_custom_command(TARGET copa2014 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/LICENSE"
+                    "$<TARGET_FILE_DIR:copa2014>/vulkan/LICENSE.dxvk.txt")
+    endif()
+endif()
