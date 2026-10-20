@@ -1,33 +1,36 @@
-# 2014 FIFA World Cup Brazil — Native PC Port (early work, native components only)
+# 2014 FIFA World Cup Brazil — Native PC Port (work in progress) | No Emulated GPU or Audio Hardware
 
 > [!WARNING]
 > This repository does **not** include the game, an ISO/XEX, EA assets, generated game code or a precompiled executable.
-> It is **not playable** yet. See [the full notice](#notice) at the end.
+> You need your own Xbox 360 Brazil (En,Pt) disc. See [the full notice](#notice) at the end.
 
-Early work towards a native PC port of the Xbox 360 game *2014 FIFA World Cup Brazil* (Copa do Mundo da FIFA Brasil 2014), based on static recompilation with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk).
+> [!TIP]
+> **New: play without a controller.** The keyboard now plays as an Xbox controller, with the basic actions of **EA SPORTS FC 27's default WASD layout**: WASD to move, **L** pass, **;** shoot, **K** cross, **O** through ball, **P** sprint, **Esc** pause. See [Keyboard controls](#keyboard-controls).
 
-## Why only part of the project is here
+An experimental port of the Xbox 360 game *2014 FIFA World Cup Brazil* (Copa do Mundo da FIFA Brasil 2014), built through static recompilation with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), with its own Direct3D 11 renderer and its own XMA audio pipeline. **This public repository is a source and local-build kit, not a ready-to-play game download.** The game's PowerPC code (`default.xex` and its two game libraries `powdllzf.xex.dll` and `FootballCompEngzf.xex.dll`) is translated locally from your own verified disc; no game executable or generated game code is distributed here.
 
-A private build of this game boots to the title screen and team selection, but its graphics still go through an **emulated** Xbox 360 GPU (the SDK's Xenos plugin) and its audio through emulated XMA contexts. This repository only publishes the parts that are already native and free of game content:
+## Status — work in progress
 
-| Path | What it is |
-| --- | --- |
-| `project/src/shader_metadata.h`, `source_shader_asset.h`, `shader_parameter_updates.h`, `source_vertex_layout.h` | Standalone importers for the game's shader and vertex-layout metadata into the PC's own buffers, with bounds, endianness and count checks. They are the groundwork for a native renderer that does not yet exist. |
-| `project/src/pc_menu.*`, `pc_audio.*` | In-game PC settings menu and per-process volume control (Windows audio session API). |
-| `project/src/kernel_extra.cpp`, `perf_hooks.cpp`, `script_input.h` | Missing kernel exports (camera reported as not connected), frame counter, scripted controller for automated tests. |
-| `project/copa2014_manifest.toml` | Function boundaries the translator needs (addresses and sizes only). |
-| `tests/` | Game-free tests of the importers. |
-| `tools/` | Disc extraction, file validation and the publication audit. |
-
-The application wiring, build files and GPU/audio paths that depend on emulation are deliberately **not** published. There is no build script for the game yet: one will be added when the renderer and audio are native, as in the [FIFA Street 3](https://github.com/batatinhafcbatatinha-pixel/fifa-street-3-pc) and [Battlefield 2: Modern Combat](https://github.com/batatinhafcbatatinha-pixel/bf2-modern-combat-pc) ports.
+- Reached on Windows 11 x64 with the native renderer: boot, menus, Kick Off (team, kit and stadium selection) and full matches, and the Skill Games.
+- Graphics: the game's Direct3D library is hooked at the API level and drawn by a native Direct3D 11 renderer; Xenos shader microcode is translated to HLSL SM5; textures are untiled and converted on load. Render-to-texture results the CPU reads (crowd sprite atlases, generated lightmaps) are written back to game memory when the game touches them. No GPU command processor or emulation plugin.
+- Audio: XMA contexts are decoded with FFmpeg's XMA decoder and mixed natively. No audio hardware model.
+- The Xbox 360 kernel and XAM services come from the ReXGlue runtime as an operating-system compatibility layer. Online features are not supported.
+- Known issues: crashes and occasional one-frame graphical glitches may remain. Windows x64 only.
 
 ## Why a native port instead of an emulator
 
-An emulator such as [Xenia](https://xenia.jp) recreates the Xbox 360 hardware and is the right tool for the whole library. The goal here is narrower: ahead-of-time compiled game code, draw calls going straight to the PC's graphics API and audio decoded natively, with every system readable and fixable in plain C++. That goal is not reached for this game yet.
+An emulator such as [Xenia](https://xenia.jp) recreates the Xbox 360: it JIT-translates the PowerPC code at run time, emulates the Xenos GPU by processing the console's command buffers and models the audio hardware. That is the right approach for the whole library. This port takes a different route for one game:
+
+- **Ahead-of-time code.** The game's PowerPC modules become C++ compiled by a modern optimizing compiler before you play.
+- **No GPU emulation in the hot path.** Draws, clears, resolves and presents of the game's D3D library are hooked and executed directly on Direct3D 11.
+- **Native audio** decoding and mixing on the PC.
+- **Readable and fixable.** Every hook, renderer path and audio routine is plain C++ in `project/src`.
+
+The trade-off: it covers only this game and revision, it is unfinished, and an emulator is the more general and better-tested option.
 
 ## Your game files
 
-Only the **Xbox 360 Brazil (En,Pt)** revision is targeted. You can already extract and validate your own disc:
+Only the **Xbox 360 Brazil (En,Pt)** revision is accepted. Extract your own disc image into a new folder and validate it:
 
 ```sh
 python tools/extract_iso.py "Copa do Mundo da FIFA Brasil 2014 (Brazil) (En,Pt).iso" --output game_files
@@ -35,25 +38,64 @@ python tools/validate_game.py game_files
 ```
 
 ```text
-default.xex                                                         63e6ebaf5117dbfaa67cb43b033486a3aeb1b1b2f644dcf61b8482e4d06c14bd
-dlc/dlc_powdll/dlc/powdll/powdllzf.xex.dll                          8ec0b3e5ef644b1c27e02c1b1111ad1aa93ee4bfee7653658f6931a949d17d80
+default.xex                                                            63e6ebaf5117dbfaa67cb43b033486a3aeb1b1b2f644dcf61b8482e4d06c14bd
+dlc/dlc_powdll/dlc/powdll/powdllzf.xex.dll                             8ec0b3e5ef644b1c27e02c1b1111ad1aa93ee4bfee7653658f6931a949d17d80
 dlc/dlc_FootballCompEng/dlc/FootballCompEng/FootballCompEngzf.xex.dll  7888f6c73e6706f7a7a401f8247f9bd95deca7edcaa2c0f5940281449a27f7d6
 ```
 
-## Run the tests
+Do not upload the ISO, extracted files, generated code or the built executables.
+
+## Build on Windows
+
+Requirements: Python 3.10+, Visual Studio 2022 Build Tools (C++ workload, Windows SDK), LLVM/Clang 20 or newer (a complete install that includes the clang resource headers), CMake 3.25+ and Ninja.
+
+```powershell
+python tools/build_local.py --game-files game_files --llvm-dir "C:\Program Files\LLVM"
+python tools/play.py --game-files game_files
+```
+
+`build_local.py` validates your files, downloads the pinned ReXGlue SDK nightly (`0.10.0.24-dev.gbd833a2`, SHA-256 checked) and applies the FPSCR patch in `patches/`, downloads the FFmpeg headers matching the SDK's `libavcodec`, translates the three modules into private C++ under `.local/`, compiles the port and removes any GPU emulation plugin from the output. Expect a long first build and several GB of disk space in `.local/`; `--reuse-generated` skips the translation on later builds.
+
+## Keyboard controls
+
+No controller needed: the keyboard plays as an Xbox controller, with the keys of the default **WASD** layout of EA SPORTS FC 27 ([EA's layout chart](https://help.ea.com/en/articles/ea-sports-fc/mouse-keyboard/)). Only the basic actions are mapped for now.
+
+| Key | In a match | In menus | Controller button |
+| --- | --- | --- | --- |
+| **W A S D** (or arrows) | Move the player | Navigate | Left stick |
+| **L** | Ground pass · press (defending) | Confirm | A |
+| **;** (**Ç** on ABNT2 keyboards) | Shoot · tackle (defending) | Back | B |
+| **K** | Lob pass / cross · sliding tackle | | X |
+| **O** | Through pass · goalkeeper rush | | Y |
+| **P** | Sprint | | RT |
+| **I** | Change player | | LB |
+| **Enter** | | Confirm, passes *PRESS START* | A + Start |
+| **Esc** | Pause | | Start |
+| **Backspace** | | Back | B |
+| **Tab** | | | Back |
+
+The keyboard and an Xbox controller work at the same time. Skill moves, modifier keys (finesse, chip, power shots) and the mouse are not mapped yet. To turn the keyboard off, add `teclado=0` to the `[opcoes]` section of `copa2014-pc.ini` next to the executable.
+
+## Settings
+
+**F1** opens the PC settings over the game (display mode, internal resolution, VSync, frame limit, FXAA, anisotropic filtering, game language — English or Brazilian Portuguese —, volume); **Alt + Enter** or **F11** toggles fullscreen. Settings are saved in `copa2014-pc.ini` and saves in `userdata/` next to the executable. Xbox controllers work as on the console.
+
+## Tests without the game
 
 ```sh
-python tools/run_native_tests.py          # clang++ or g++ with C++20
-python tools/test_tools.py -v             # extractor and validator, no game needed
+python tools/run_native_tests.py          # shader / vertex-layout importers, clang++ or g++ with C++20
+python tools/test_tools.py -v             # extractor and validator
 ```
 
 ## Credits and licenses
 
-- Port work: [batatinhafcbatatinha-pixel](https://github.com/batatinhafcbatatinha-pixel).
-- [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk): Tom Clay and contributors, BSD-3-Clause; derived from [Xenia](https://github.com/xenia-project/xenia). Not included; license in `licenses/`.
+- Port integration, native renderer and audio: [batatinhafcbatatinha-pixel](https://github.com/batatinhafcbatatinha-pixel).
+- [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk): Tom Clay and contributors, BSD-3-Clause; derived from [Xenia](https://github.com/xenia-project/xenia) (Ben Vanik and contributors). External dependency, downloaded by the build script; license in `licenses/`. The texture untiling and format rules follow Xenia's BSD-licensed `texture_util`; shader-microcode semantics follow the SDK's Xenia-derived headers.
+- [FFmpeg](https://ffmpeg.org) (Xenia fork by wmarti), LGPL-2.1: the SDK's prebuilt `libavcodec`/`libavutil` and their public headers, downloaded at build time.
+- Microsoft Visual C++ runtime, Windows SDK, Direct3D and XAudio2: Microsoft; obtained separately.
 - 2014 FIFA World Cup Brazil, its game code, trademarks and assets belong to Electronic Arts, FIFA and the respective rights holders. This project is not affiliated with or endorsed by EA, FIFA or Microsoft.
 
-See [NOTICE.md](NOTICE.md) and [LICENSE](LICENSE).
+See [NOTICE.md](NOTICE.md) for the publication boundary and [LICENSE](LICENSE) for the license of the port's own code.
 
 ---
 
