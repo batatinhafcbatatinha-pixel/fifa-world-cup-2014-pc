@@ -6,7 +6,10 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+
+#include <rex/logging.h>
 
 namespace copa {
 
@@ -389,6 +392,7 @@ bool LoadTexture(const TextureDesc& d, const std::function<const uint8_t*(uint32
   const uint8_t* mem = physical(0);
   if (!mem) return false;
   std::vector<uint8_t> block(64);
+  static const bool no_texture_runs = std::getenv("COPA_NO_TEXTURE_RUNS") != nullptr;
   for (uint32_t level = first_level; level <= last_level; ++level) {
     uint32_t stored_level = std::min(level, packed_level);
     LevelLayout l{};
@@ -409,7 +413,45 @@ bool LoadTexture(const TextureDesc& d, const std::function<const uint8_t*(uint32
       sub.data.assign(sub.slice_pitch, 0);
       const bool volume = d.dimension == 2;
       uint32_t slice_base = l.address + slice * (volume ? (d.tiled ? 0 : l.z_stride) : l.slice_stride);
-      for (uint32_t by = 0; by < by_count; ++by) {
+      // Fast path: plain copies (no conversion) move whole runs that stay contiguous in guest
+      // memory (16 bytes in the tiled layout, the whole row when linear) instead of one block
+      // at a time. Same bytes as the per-block loop; the swap unit must fit in a block.
+      const uint32_t bpb = f.guest_bytes_per_block;
+      const bool run_copy = !ctx1 && !f.convert && bpb == f.host_bytes_per_block && !volume &&
+                            bpb && bpb <= 16 && (bpb & (bpb - 1)) == 0 &&
+                            (d.endian == 0 || d.endian > 3 || (d.endian == 1 ? bpb >= 2 : bpb >= 4)) &&
+                            !no_texture_runs;
+      const uint32_t tiled_run = std::max(1u, 16u >> log2_bpb);
+      for (uint32_t by = 0; run_copy && by < by_count; ++by) {
+        uint8_t* row_dst = sub.data.data() + by * host_row;
+        uint32_t y = by + l.offset_y;
+        for (uint32_t bx = 0; bx < bx_count;) {
+          uint32_t x = bx + l.offset_x;
+          uint32_t n, src;
+          if (!d.tiled) {
+            n = bx_count - bx;
+            src = slice_base + y * l.row_pitch + x * bpb;
+          } else {
+            n = std::min(tiled_run - (x & (tiled_run - 1)), bx_count - bx);
+            src = slice_base + uint32_t(TiledOffset2D(int32_t(x), int32_t(y), l.pitch_blocks, log2_bpb));
+          }
+          if ((src & 0x1FFFFFFF) + n * bpb <= 0x20000000u) {
+            SwapCopy(d.endian, row_dst + bx * bpb, mem + (src & 0x1FFFFFFF), n * bpb);
+          } else {
+            for (uint32_t k = 0; k < n; ++k) {  // per block, as below
+              uint32_t b = src + k * bpb;
+              if ((b & 0x1FFFFFFF) + bpb <= 0x20000000u)
+                SwapCopy(d.endian, row_dst + (bx + k) * bpb, mem + (b & 0x1FFFFFFF), bpb);
+            }
+          }
+          bx += n;
+        }
+      }
+      // COPA_TEXTURE_RUNS_CHECK=1: also run the per-block loop and compare the bytes.
+      static const bool runs_check = std::getenv("COPA_TEXTURE_RUNS_CHECK") != nullptr;
+      std::vector<uint8_t> fast_bytes;
+      if (run_copy && runs_check) fast_bytes = sub.data;
+      for (uint32_t by = 0; (!run_copy || runs_check) && by < by_count; ++by) {
         for (uint32_t bx = 0; bx < bx_count; ++bx) {
           uint32_t x = bx + l.offset_x, y = by + l.offset_y;
           uint32_t src;
@@ -445,6 +487,14 @@ bool LoadTexture(const TextureDesc& d, const std::function<const uint8_t*(uint32
           else
             std::memcpy(dst, block.data(), f.host_bytes_per_block);
         }
+      }
+      if (!fast_bytes.empty()) {
+        static int checks = 0, mismatches = 0;
+        bool same = fast_bytes == sub.data;
+        if (!same) ++mismatches;
+        if (!same || (++checks % 200) == 0)
+          REXLOG_INFO("copa texture runs check: addr={:08X} fmt={} level={} bpb={} endian={} tiled={} same={} ({} checked, {} mismatches)",
+                      d.base_address, d.format, level, bpb, d.endian, d.tiled, same, checks, mismatches);
       }
     }
   }

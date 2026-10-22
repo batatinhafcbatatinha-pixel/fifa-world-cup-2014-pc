@@ -2,6 +2,7 @@
 #pragma once
 
 #include "pc_settings.h"
+#include "native/post_effects.h"
 
 inline pcs::GameInfo PcGameInfo() {
   // data/loc/locale.big ships eng_us and por_br (XC_LANGUAGE ids).
@@ -13,6 +14,13 @@ inline pcs::GameInfo PcGameInfo() {
   info.languages = kLanguages;
   info.language_count = int(sizeof(kLanguages) / sizeof(kLanguages[0]));
   info.internal_resolution = true;
+  static const pcs::Effect kEffects[] = {
+      {"brightness_contrast", L"Brilho e contraste cinematográficos", L"Cinematic brightness and contrast",
+       L"Ajuste de brilho e contraste aplicado pelo jogo.", L"The game's final brightness and contrast adjustment."},
+  };
+  static_assert(sizeof(kEffects) / sizeof(kEffects[0]) == ea_postfx::Count);
+  info.effects = kEffects;
+  info.effect_count = ea_postfx::Count;
   info.football_keyboard = true;
   // Measured 2026-10-20 at a 120 Hz vblank with no limit: the match/drill clock keeps real time at
   // 70-150 fps and the menus do not wait for the vblank, so frame rates above 60 are safe.

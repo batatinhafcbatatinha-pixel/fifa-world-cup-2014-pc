@@ -10,6 +10,7 @@
 // (NATIVE_PLAN.md); the ABIs are identical.
 
 #include <rex/hook.h>
+#include "../pc_settings.h"
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/runtime.h>
@@ -542,3 +543,4 @@ REX_HOOK_RAW(sub_82459A80) {
   static std::atomic<int> logged{0};
   if (logged++ < 20) REXLOG_INFO("copa GPU hang recovery lr={:08X} -> {}", lr, ctx.r3.u32);
 }
+
