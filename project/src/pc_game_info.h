@@ -4,6 +4,8 @@
 #include "pc_settings.h"
 #include "native/post_effects.h"
 
+const pcs::Theme* PcCopaTheme();  // pc_theme.cpp
+
 inline pcs::GameInfo PcGameInfo() {
   // data/loc/locale.big ships eng_us and por_br (XC_LANGUAGE ids).
   static const pcs::Language kLanguages[] = {{1, L"English"}, {9, L"Português (Brasil)"}};
@@ -25,5 +27,6 @@ inline pcs::GameInfo PcGameInfo() {
   // Measured 2026-10-20 at a 120 Hz vblank with no limit: the match/drill clock keeps real time at
   // 70-150 fps and the menus do not wait for the vblank, so frame rates above 60 are safe.
   info.real_time = true;
+  info.theme = PcCopaTheme();
   return info;
 }

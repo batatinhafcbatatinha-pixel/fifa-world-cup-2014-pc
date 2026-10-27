@@ -29,6 +29,8 @@ set(COPA2014_SOURCES
     src/kernel_extra.cpp
     src/menu_hooks.cpp
     src/pc_settings.cpp
+    src/pc_theme.cpp
+    src/pc_font.cpp
     src/native/d3d_hooks.cpp
     src/native/renderer.cpp
     src/native/shader_translator.cpp
@@ -66,7 +68,7 @@ endif()
 
 # Hooks on functions of the UI module must be compiled into that module.
 if(TARGET copa2014_powdllzf_xex)
-    target_sources(copa2014_powdllzf_xex PRIVATE src/pow_hooks.cpp src/pc_settings.cpp)
+    target_sources(copa2014_powdllzf_xex PRIVATE src/pow_hooks.cpp src/pc_settings.cpp src/pc_theme.cpp src/pc_font.cpp)
     target_include_directories(copa2014_powdllzf_xex PRIVATE src src/native)
     target_link_libraries(copa2014_powdllzf_xex PRIVATE d3d11 dxgi)
 endif()
