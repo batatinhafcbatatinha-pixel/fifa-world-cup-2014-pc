@@ -290,6 +290,9 @@ float4 ps_main(O i) : SV_Target {
   return params.y != 0.0 ? c.bgra : c;
 }
 float ps_depth(O i) : SV_Target { return src.SampleLevel(samp, i.uv, 0).r; }
+// MSAA depth to a single-sample float texture (sample 0), drawn over the whole target.
+Texture2DMS<float4> src_ms : register(t0);
+float ps_depth_ms(O i) : SV_Target { return src_ms.Load(int2(i.pos.xy), 0).r; }
 )HLSL";
 
 struct ShaderEntry {
@@ -308,10 +311,15 @@ struct RenderTarget {
   bool depth = false;
   uint32_t width = 0, height = 0;
   float scale = 1.0f;
+  uint32_t samples = 1;  // MSAA (PC settings)
   Com<ID3D11Texture2D> texture;
   Com<ID3D11RenderTargetView> rtv;
   Com<ID3D11DepthStencilView> dsv;
   Com<ID3D11ShaderResourceView> srv;
+  // MSAA: single-sample copy for resolves (RendererImpl::SingleSampleSrv).
+  Com<ID3D11Texture2D> single;
+  Com<ID3D11ShaderResourceView> single_srv;
+  Com<ID3D11RenderTargetView> single_rtv;
   uint64_t last_used = 0;
 };
 
@@ -410,7 +418,25 @@ class RendererImpl {
                                uint32_t format, bool create);
   void BlitTo(ID3D11RenderTargetView* rtv, uint32_t dst_w, uint32_t dst_h, D3D11_VIEWPORT vp,
               ID3D11ShaderResourceView* src, float src_w, float src_h, float u0, float v0,
-              float u1, float v1, bool depth, bool swap_rb = false, bool point = false);
+              float u1, float v1, bool depth, bool swap_rb = false, bool point = false,
+              ID3D11PixelShader* shader = nullptr);
+  ID3D11ShaderResourceView* SingleSampleSrv(RenderTarget& rt);
+  // MSAA (PC settings, live) on the targets the internal resolution scales; resolves read a
+  // single-sample copy (SingleSampleSrv).
+  uint32_t msaa_ = 1, msaa_wanted_ = 0, bound_samples_ = 1;
+  uint32_t SamplesFor(uint32_t width) const { return width >= 640 ? msaa_ : 1; }
+  void UpdateMsaa() {
+    uint32_t want = uint32_t(pcs::MsaaSamples());
+    if (want == msaa_wanted_) return;
+    msaa_wanted_ = want;
+    uint32_t m = pcs::SupportedSamples(device_.get(), want,
+                                       {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                                        DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                        DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+                                        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT});
+    if (m != msaa_) REXLOG_INFO("copa renderer: MSAA {}x -> {}x (asked {}x)", msaa_, m, want);
+    msaa_ = m;
+  }
   // Internal resolution. Render targets and resolve destinations at least 640 wide (the scene,
   // half-resolution post-processing, shadow maps) are drawn scale_ times larger; smaller ones
   // (light probes, reduction chains, lightmaps the CPU compresses) keep the guest size: scaling
@@ -719,7 +745,7 @@ class RendererImpl {
   uint32_t index_capacity_ = 0;
   Com<ID3D11GeometryShader> rect_gs_;
   Com<ID3D11VertexShader> blit_vs_;
-  Com<ID3D11PixelShader> blit_ps_, blit_depth_ps_;
+  Com<ID3D11PixelShader> blit_ps_, blit_depth_ps_, blit_depth_ms_ps_;
   Com<ID3D11SamplerState> linear_clamp_, point_clamp_;
   Com<ID3D11RasterizerState> blit_raster_;
   Com<ID3D11DepthStencilState> no_depth_;
@@ -801,6 +827,7 @@ bool RendererImpl::EnsureDevice() {
     device_failed_ = true;
     return false;
   }
+  UpdateMsaa();
   context_->QueryInterface(__uuidof(ID3D11DeviceContext1),
                            reinterpret_cast<void**>(context1_.put()));
   // On-demand resolve write-backs run on the CPU thread that touches the memory.
@@ -850,6 +877,8 @@ bool RendererImpl::EnsureDevice() {
     device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_ps_.put());
   if (Compile(kBlitHlsl, "ps_depth", "ps_5_0", code, internal(kBlitHlsl, "blit_depth_ps")))
     device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_depth_ps_.put());
+  if (Compile(kBlitHlsl, "ps_depth_ms", "ps_5_0", code, internal(kBlitHlsl, "blit_depth_ms_ps")))
+    device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_depth_ms_ps_.put());
 
   D3D11_SAMPLER_DESC sd{};
   sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1007,7 +1036,8 @@ RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t 
   uint64_t key = uint64_t(base) | (uint64_t(format) << 12) | (uint64_t(pitch) << 20) |
                  (uint64_t(depth) << 40);
   auto& slot = render_targets_[key];
-  if (slot && slot->height >= height && slot->scale == ScaleFor(pitch)) {
+  const uint32_t samples = SamplesFor(pitch);
+  if (slot && slot->height >= height && slot->scale == ScaleFor(pitch) && slot->samples == samples) {
     slot->last_used = frame_;
     return slot.get();
   }
@@ -1016,6 +1046,7 @@ RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t 
   rt->format = format;
   rt->pitch = pitch;
   rt->depth = depth;
+  rt->samples = samples;
   rt->width = pitch;
   rt->height = std::max(height, slot ? slot->height : 0u);
   D3D11_TEXTURE2D_DESC td{};
@@ -1024,7 +1055,7 @@ RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t 
   td.Height = ScaledSize(rt->height, rt->scale);
   td.MipLevels = 1;
   td.ArraySize = 1;
-  td.SampleDesc.Count = 1;
+  td.SampleDesc.Count = rt->samples;
   td.Usage = D3D11_USAGE_DEFAULT;
   if (depth) {
     bool fdepth = format == 1;
@@ -1033,11 +1064,11 @@ RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t 
     device_->CreateTexture2D(&td, nullptr, rt->texture.put());
     D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
     dv.Format = fdepth ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D24_UNORM_S8_UINT;
-    dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    dv.ViewDimension = rt->samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
     device_->CreateDepthStencilView(rt->texture.get(), &dv, rt->dsv.put());
     D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = fdepth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.ViewDimension = rt->samples > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
     sv.Texture2D.MipLevels = 1;
     device_->CreateShaderResourceView(rt->texture.get(), &sv, rt->srv.put());
     context_->ClearDepthStencilView(rt->dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
@@ -1051,7 +1082,7 @@ RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t 
     context_->ClearRenderTargetView(rt->rtv.get(), zero);
   }
   if (!rt->texture) return nullptr;
-  if (slot && slot->texture && slot->scale == rt->scale) {
+  if (slot && slot->texture && slot->scale == rt->scale && slot->samples == rt->samples) {
     // Keep the old contents when growing.
     D3D11_BOX box{0, 0, 0, ScaledSize(slot->width, slot->scale), ScaledSize(slot->height, slot->scale), 1};
     context_->CopySubresourceRegion(rt->texture.get(), 0, 0, 0, 0, slot->texture.get(), 0, &box);
@@ -1627,7 +1658,8 @@ void RendererImpl::SetupStates(const GuestDevice& dev, uint32_t color_mask_activ
   uint32_t scale_bits, offset_bits;
   std::memcpy(&scale_bits, &offset_scale, 4);
   std::memcpy(&offset_bits, &offset, 4);
-  uint64_t rkey = uint64_t(mode & 0x1F) | (uint64_t(scale_bits) << 5) ^ (uint64_t(offset_bits) << 31);
+  uint64_t rkey = (uint64_t(mode & 0x1F) | (uint64_t(scale_bits) << 5) ^ (uint64_t(offset_bits) << 31)) ^
+                  (uint64_t(bound_samples_ > 1) << 63);
   auto& rs = raster_states_[rkey];
   if (!rs) {
     D3D11_RASTERIZER_DESC d{};
@@ -1643,6 +1675,7 @@ void RendererImpl::SetupStates(const GuestDevice& dev, uint32_t color_mask_activ
     d.SlopeScaledDepthBias = offset_scale / 16.0f;
     d.DepthClipEnable = TRUE;
     d.ScissorEnable = TRUE;
+    d.MultisampleEnable = bound_samples_ > 1;
     device_->CreateRasterizerState(&d, rs.put());
   }
   context_->RSSetState(rs.get());
@@ -1742,6 +1775,9 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   ID3D11ShaderResourceView* null_srvs[32] = {};
   context_->PSSetShaderResources(0, 32, null_srvs);
   context_->OMSetRenderTargets(4, rtvs, dsv);
+  bound_samples_ = bound_depth_ ? bound_depth_->samples : 1;
+  for (auto* c : bound_color_)
+    if (c) bound_samples_ = c->samples;
 
   // Geometry.
   D3D11_PRIMITIVE_TOPOLOGY topology;
@@ -2299,7 +2335,8 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
 // --------------------------------------------------------------------------- blit
 void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11_VIEWPORT vp,
                           ID3D11ShaderResourceView* src, float, float, float u0, float v0,
-                          float u1, float v1, bool depth, bool swap_rb, bool point) {
+                          float u1, float v1, bool depth, bool swap_rb, bool point,
+                          ID3D11PixelShader* shader) {
   float cb[8] = {u0, v0, u1 - u0, v1 - v0, 1.0f, swap_rb ? 1.0f : 0.0f, 0, 0};
   D3D11_MAPPED_SUBRESOURCE m;
   if (SUCCEEDED(context_->Map(cb_blit_.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -2320,7 +2357,7 @@ void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11
   context_->IASetInputLayout(nullptr);
   context_->VSSetShader(blit_vs_.get(), nullptr, 0);
   context_->GSSetShader(nullptr, nullptr, 0);
-  context_->PSSetShader(depth ? blit_depth_ps_.get() : blit_ps_.get(), nullptr, 0);
+  context_->PSSetShader(shader ? shader : depth ? blit_depth_ps_.get() : blit_ps_.get(), nullptr, 0);
   ID3D11Buffer* b = cb_blit_.get();
   context_->VSSetConstantBuffers(0, 1, &b);
   context_->PSSetConstantBuffers(0, 1, &b);
@@ -2331,6 +2368,34 @@ void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11
   context_->PSSetShaderResources(0, 32, null_srvs);
 }
 
+
+// MSAA: what a resolve reads from a multisampled target, refreshed at each call: color is the
+// average of the samples (ResolveSubresource), depth sample 0 as a 32-bit float texture.
+ID3D11ShaderResourceView* RendererImpl::SingleSampleSrv(RenderTarget& rt) {
+  if (rt.samples <= 1) return rt.srv.get();
+  D3D11_TEXTURE2D_DESC td;
+  rt.texture->GetDesc(&td);
+  const DXGI_FORMAT format = td.Format;
+  if (!rt.single) {
+    td.SampleDesc = {1, 0};
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (rt.depth) {
+      td.Format = DXGI_FORMAT_R32_FLOAT;
+      td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    }
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, rt.single.put()))) return nullptr;
+    device_->CreateShaderResourceView(rt.single.get(), nullptr, rt.single_srv.put());
+    if (rt.depth) device_->CreateRenderTargetView(rt.single.get(), nullptr, rt.single_rtv.put());
+  }
+  if (rt.depth) {
+    D3D11_VIEWPORT vp{0, 0, float(td.Width), float(td.Height), 0, 1};
+    BlitTo(rt.single_rtv.get(), td.Width, td.Height, vp, rt.srv.get(), 1, 1, 0, 0, 1, 1, true, false, true,
+           blit_depth_ms_ps_.get());
+  } else {
+    context_->ResolveSubresource(rt.single.get(), 0, rt.texture.get(), 0, format);
+  }
+  return rt.single_srv.get();
+}
 
 // Internal resolution: the region of a scaled resolve result drawn at guest size, into a texture
 // kept per destination (tiled frames add their rectangles to the same one).
@@ -2919,7 +2984,7 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
       bool swap = !src->depth && src->format <= 1 && (dest_format == 6 || dest_format == 62 || dest_format == 15) &&
                   req.dest_red_blue_swap != 0;
       dst->bgra = swap;
-      BlitTo(dst->rtv.get(), dst->width, dst->height, vp, src->srv.get(), sw, sh, x0 / sw, y0 / sh,
+      BlitTo(dst->rtv.get(), dst->width, dst->height, vp, SingleSampleSrv(*src), sw, sh, x0 / sw, y0 / sh,
              x1 / sw, y1 / sh, src->depth, swap);
       static const bool writeback = std::getenv("COPA_NO_RESOLVE_WRITEBACK") == nullptr;
       if (writeback)
@@ -2932,8 +2997,8 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
       dst->frame = frame_;
       if (TraceFrame(frame_) && !src->depth)
         REXLOG_INFO("trace resolve pixels swap={} src L={:08X} R={:08X} dst L={:08X} R={:08X} ({}x{})", swap,
-                    ReadPixel(src->texture.get(), src->width / 4, src->height / 2),
-                    ReadPixel(src->texture.get(), src->width * 3 / 4, src->height / 2),
+                    src->samples > 1 ? 0u : ReadPixel(src->texture.get(), src->width / 4, src->height / 2),
+                    src->samples > 1 ? 0u : ReadPixel(src->texture.get(), src->width * 3 / 4, src->height / 2),
                     ReadPixel(dst->texture.get(), dst->width / 4, dst->height / 2),
                     ReadPixel(dst->texture.get(), dst->width * 3 / 4, dst->height / 2), dst->width,
                     dst->height);
@@ -3303,6 +3368,8 @@ void RendererImpl::Present(const uint8_t* fetch) {
     REXLOG_INFO("copa renderer: internal resolution x{:.3f} -> x{:.3f}", scale_, s);
     scale_ = s;
   }
+  // MSAA likewise: targets of another sample count are recreated as they are used.
+  UpdateMsaa();
   auto present_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - present_start).count();
   static int slow_logs = 0;

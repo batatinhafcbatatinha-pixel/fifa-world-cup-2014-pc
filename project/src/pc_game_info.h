@@ -16,6 +16,7 @@ inline pcs::GameInfo PcGameInfo() {
   info.languages = kLanguages;
   info.language_count = int(sizeof(kLanguages) / sizeof(kLanguages[0]));
   info.internal_resolution = true;
+  info.msaa = true;
   static const pcs::Effect kEffects[] = {
       {"brightness_contrast", L"Brilho e contraste cinematográficos", L"Cinematic brightness and contrast",
        L"Ajuste de brilho e contraste aplicado pelo jogo.", L"The game's final brightness and contrast adjustment."},
