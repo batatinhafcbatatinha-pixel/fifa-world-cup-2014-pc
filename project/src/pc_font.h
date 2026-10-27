@@ -17,4 +17,10 @@ std::filesystem::path GameRoot(const char* fallback);
 // `pixels` em height into `out` (Latin, Latin-1, Cyrillic and a few symbols). Throws on failure.
 void LoadTtf(const std::filesystem::path& root, const std::string& entry, int pixels, pcs::ThemeFont& out);
 
+// The same from a TTF file (a font the port may ship, such as a freely licensed one).
+void LoadTtfFile(const std::filesystem::path& file, int pixels, pcs::ThemeFont& out);
+
+// The executable's folder (fonts shipped with the port live in its fonts\ subfolder).
+std::filesystem::path ExeDir();
+
 }  // namespace pcfont

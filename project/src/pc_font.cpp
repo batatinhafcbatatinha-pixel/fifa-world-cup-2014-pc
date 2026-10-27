@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -112,6 +113,16 @@ Bytes ChunkLzx(const Bytes& in) {
   return out;
 }
 
+// The face's weight (OS/2 usWeightClass), so GDI picks this face among a family's styles.
+int Weight(const Bytes& ttf) {
+  uint32_t tables = BE(ttf, 4, 2);
+  for (uint32_t t = 0; t < tables; ++t) {
+    size_t rec = 12 + size_t(t) * 16;
+    if (BE(ttf, rec) == 0x4F532F32u) return int(BE(ttf, BE(ttf, rec + 8) + 4, 2));  // 'OS/2'
+  }
+  return FW_NORMAL;
+}
+
 // The family name GDI knows the font by: the 'name' table, Windows platform, name ID 1.
 std::wstring FamilyName(const Bytes& ttf) {
   uint32_t tables = BE(ttf, 4, 2);
@@ -135,6 +146,8 @@ std::wstring FamilyName(const Bytes& ttf) {
 
 }  // namespace
 
+void Rasterize(const Bytes& ttf, const std::string& entry, int pixels, pcs::ThemeFont& out);
+
 std::filesystem::path GameRoot(const char* fallback) {
   auto cvar = rex::cvar::GetFlagByName("game_data_root");
   if (!cvar.empty()) return std::filesystem::u8path(cvar);
@@ -144,14 +157,24 @@ std::filesystem::path GameRoot(const char* fallback) {
 void LoadTtf(const std::filesystem::path& root, const std::string& entry, int pixels, pcs::ThemeFont& out) {
   Bytes packed;
   Require(ReadBigEntry(root, entry, packed), "font not found in data*.big");
-  Bytes ttf = ChunkLzx(packed);
+  Rasterize(ChunkLzx(packed), entry, pixels, out);
+}
+
+void LoadTtfFile(const std::filesystem::path& file, int pixels, pcs::ThemeFont& out) {
+  std::ifstream f(file, std::ios::binary);
+  Require(bool(f), "font file missing");
+  Bytes ttf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  Rasterize(ttf, file.filename().string(), pixels, out);
+}
+
+void Rasterize(const Bytes& ttf, const std::string& entry, int pixels, pcs::ThemeFont& out) {
   Require(ttf.size() > 12, "empty font");
   std::wstring family = FamilyName(ttf);
   DWORD installed = 0;
   // Private to this process: the font is not added to Windows.
-  Require(AddFontMemResourceEx(ttf.data(), DWORD(ttf.size()), nullptr, &installed) && installed,
+  Require(AddFontMemResourceEx(const_cast<uint8_t*>(ttf.data()), DWORD(ttf.size()), nullptr, &installed) && installed,
           "GDI refused the font");
-  HFONT font = CreateFontW(-pixels, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_ONLY_PRECIS,
+  HFONT font = CreateFontW(-pixels, 0, 0, 0, Weight(ttf), FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_ONLY_PRECIS,
                            CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, family.c_str());
   Require(font != nullptr, "CreateFont failed");
   HDC dc = CreateCompatibleDC(nullptr);
@@ -241,4 +264,12 @@ void LoadTtf(const std::filesystem::path& root, const std::string& entry, int pi
               out.glyphs.size(), pixels);
 }
 
+}  // namespace pcfont
+
+namespace pcfont {
+std::filesystem::path ExeDir() {
+  wchar_t path[MAX_PATH];
+  DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  return std::filesystem::path(std::wstring(path, n)).parent_path();
+}
 }  // namespace pcfont
