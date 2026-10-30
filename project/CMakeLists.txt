@@ -33,6 +33,7 @@ set(COPA2014_SOURCES
     src/pc_font.cpp
     src/native/d3d_hooks.cpp
     src/native/renderer.cpp
+    src/native/game_natives.cpp
     src/native/shader_translator.cpp
     src/native/texture_loader.cpp
     src/native/native_audio.cpp

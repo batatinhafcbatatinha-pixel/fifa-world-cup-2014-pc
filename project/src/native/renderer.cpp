@@ -52,6 +52,11 @@
 
 namespace copa {
 
+namespace natives {
+bool NativeOn();  // game_natives.cpp (COPA_NATIVE_AB)
+void FrameTick();
+}  // namespace natives
+
 namespace {
 // Same as TiledOffset2D (texture_loader.cpp), inlined for the resolve write-back loop.
 inline int32_t TiledOffset2DInline(int32_t x, int32_t y, uint32_t pitch, uint32_t log2_bpb) {
@@ -2056,9 +2061,14 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
 
   // ALU constants: VS c0-c255 = dwords 0-1023, PS c0-c255 = dwords 1024-2047.
   static thread_local std::vector<uint32_t> alu(2048);
-  for (int i = 0; i < 1024; ++i) {
-    alu[i] = LoadBE32(dev.vs_constants() + i * 4);
-    alu[1024 + i] = LoadBE32(dev.ps_constants() + i * 4);
+  if (natives::NativeOn()) {
+    LoadBE32Array(alu.data(), dev.vs_constants(), 1024);
+    LoadBE32Array(alu.data() + 1024, dev.ps_constants(), 1024);
+  } else {
+    for (int i = 0; i < 1024; ++i) {
+      alu[i] = LoadBE32(dev.vs_constants() + i * 4);
+      alu[1024 + i] = LoadBE32(dev.ps_constants() + i * 4);
+    }
   }
   // Shader literal constants: the D3D flush (0x824575D8 -> 0x824573E8) has the GPU load
   // them straight from the shader's memory (LOAD_ALU_CONST), bypassing the device's
@@ -3312,6 +3322,7 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
 
 // --------------------------------------------------------------------------- present
 void RendererImpl::Present(const uint8_t* fetch) {
+  natives::FrameTick();
   RenderPhase profile(RenderProfile::Present);
   auto enter = std::chrono::steady_clock::now();
   if (!EnsureDevice()) return;

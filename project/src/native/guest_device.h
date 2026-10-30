@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <rex/memory.h>
+#include <simde/x86/ssse3.h>
 
 namespace copa {
 
@@ -21,6 +22,15 @@ inline uint32_t LoadBE32(const void* p) {
   uint32_t v;
   std::memcpy(&v, p, 4);
   return rex::byte_swap(v);
+}
+// n big-endian dwords (16-byte shuffles; same values as LoadBE32 one by one).
+inline void LoadBE32Array(uint32_t* dst, const uint8_t* src, size_t n) {
+  const simde__m128i swap = simde_mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+  size_t i = 0;
+  for (; i + 4 <= n; i += 4)
+    simde_mm_storeu_si128(reinterpret_cast<simde__m128i*>(dst + i),
+                          simde_mm_shuffle_epi8(simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(src + i * 4)), swap));
+  for (; i < n; ++i) dst[i] = LoadBE32(src + i * 4);
 }
 inline uint16_t LoadBE16(const void* p) {
   uint16_t v;
