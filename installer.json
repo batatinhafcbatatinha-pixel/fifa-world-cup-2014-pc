@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "2014 FIFA World Cup Brazil",
+  "revision": "Xbox 360, Brazil (En,Pt)",
+  "filesystem": "xdvdfs",
+  "destination": "game_files",
+  "required_files": {
+    "default.xex": "63e6ebaf5117dbfaa67cb43b033486a3aeb1b1b2f644dcf61b8482e4d06c14bd",
+    "dlc/dlc_powdll/dlc/powdll/powdllzf.xex.dll": "8ec0b3e5ef644b1c27e02c1b1111ad1aa93ee4bfee7653658f6931a949d17d80",
+    "dlc/dlc_FootballCompEng/dlc/FootballCompEng/FootballCompEngzf.xex.dll": "7888f6c73e6706f7a7a401f8247f9bd95deca7edcaa2c0f5940281449a27f7d6"
+  },
+  "required_paths": [
+    "data"
+  ]
+}
