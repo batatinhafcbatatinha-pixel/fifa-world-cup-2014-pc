@@ -12,8 +12,16 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#ifdef _WIN32
 #include <windows.h>
+#ifndef _WIN32
+#include "../platform/native_win32_posix.h"
+#endif
 #include <xaudio2.h>
+#else
+#include <SDL3/SDL.h>
+#endif
+#include <bit>
 
 #include <future>
 
@@ -73,10 +81,10 @@ std::atomic<uint64_t> g_xma_created{0}, g_xma_kicks{0}, g_xma_frames{0}, g_xma_e
 uint32_t LoadBE(const uint8_t* base, uint32_t address) {
   uint32_t v;
   std::memcpy(&v, copa::GuestPtr(const_cast<uint8_t*>(base), address), 4);
-  return _byteswap_ulong(v);
+  return std::byteswap(v);
 }
 void StoreBE(uint8_t* base, uint32_t address, uint32_t value) {
-  value = _byteswap_ulong(value);
+  value = std::byteswap(value);
   std::memcpy(copa::GuestPtr(base, address), &value, 4);
 }
 uint8_t* Physical(uint32_t address) { return Memory()->TranslatePhysical(address); }
@@ -92,7 +100,7 @@ class BitStream {
     size_t byte = offset_ >> 3, rel = offset_ & 7;
     uint64_t bits;
     std::memcpy(&bits, buffer_ + byte, 8);
-    bits = _byteswap_uint64(bits);
+    bits = std::byteswap(bits);
     bits >>= 64 - (rel + n);
     return bits & ((1ull << n) - 1);
   }
@@ -528,7 +536,7 @@ class XmaContext {
     for (uint32_t i = 0; i < kSamplesPerFrame; ++i) {
       for (uint32_t c = 0; c <= uint32_t(stereo); ++c) {
         float v = std::clamp(c ? ch1[i] : ch0[i], -1.0f, 1.0f) * 32767.0f;
-        out[o++] = int16_t(_byteswap_ushort(uint16_t(int16_t(v))));
+        out[o++] = int16_t(std::byteswap(uint16_t(int16_t(v))));
       }
     }
   }
@@ -682,7 +690,7 @@ class RenderDriver {
     auto ch = [&](int c, int i) {
       uint32_t v;
       std::memcpy(&v, samples + (c * kSamples + i) * 4, 4);
-      v = _byteswap_ulong(v);
+      v = std::byteswap(v);
       float f;
       std::memcpy(&f, &v, 4);
       return f;
@@ -715,6 +723,18 @@ class RenderDriver {
   }
 
   bool InitXAudio() {
+#ifndef _WIN32
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) return false;
+    SDL_AudioSpec spec{SDL_AUDIO_F32, 2, 48000};
+    stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    if (!stream_) return false;
+    if (!SDL_ResumeAudioStreamDevice(stream_)) {
+      SDL_DestroyAudioStream(stream_);
+      stream_ = nullptr;
+      return false;
+    }
+    return true;
+#else
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(XAudio2Create(&xaudio_, 0, XAUDIO2_DEFAULT_PROCESSOR))) return false;
     if (FAILED(xaudio_->CreateMasteringVoice(&master_))) return false;
@@ -728,17 +748,22 @@ class RenderDriver {
     if (FAILED(xaudio_->CreateSourceVoice(&voice_, &f))) return false;
     voice_->Start(0);
     return true;
+#endif
   }
 
   // XAudio2 creation can block indefinitely when the audio endpoint is wedged (seen while
   // a killed instance was still being torn down); never let that stall the game.
   bool InitXAudioWithTimeout() {
+#ifndef _WIN32
+    return InitXAudio();
+#else
     auto done = std::make_shared<std::promise<bool>>();
     auto result = done->get_future();
     std::thread([this, done] { done->set_value(InitXAudio()); }).detach();
     if (result.wait_for(std::chrono::seconds(3)) == std::future_status::ready) return result.get();
     REXLOG_ERROR("copa audio: XAudio2 initialization timed out");
     return false;
+#endif
   }
 
   int Loop() {
@@ -775,11 +800,24 @@ class RenderDriver {
       if (audio) {
         // PC settings volume (0 while the settings menu holds the game).
         float volume = pcs::Volume();
+#ifdef _WIN32
         if (volume != volume_) master_->SetVolume(volume_ = volume);
         XAUDIO2_VOICE_STATE st;
         voice_->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
         queued = st.BuffersQueued;
         while (in_flight.size() > queued) in_flight.pop_front();
+#else
+        if (volume != volume_) SDL_SetAudioStreamGain(stream_, volume_ = volume);
+        const int bytes = SDL_GetAudioStreamQueued(stream_);
+        if (bytes < 0) {
+          SDL_DestroyAudioStream(stream_);
+          stream_ = nullptr;
+          audio = false;
+          next = std::chrono::steady_clock::now();
+        } else {
+          queued = (uint32_t(bytes) + kSamples * 8 - 1) / (kSamples * 8);
+        }
+#endif
       }
       bool need = audio ? queued < 3 : std::chrono::steady_clock::now() >= next;
       if (!need) {
@@ -813,11 +851,20 @@ class RenderDriver {
         for (size_t i = 0; i < mixed.size(); ++i) mixed[i] += f[i];
       for (auto& v : mixed) v = std::clamp(v, -1.0f, 1.0f);
       if (audio) {
+#ifdef _WIN32
         in_flight.push_back(std::move(mixed));
         XAUDIO2_BUFFER b{};
         b.AudioBytes = UINT32(in_flight.back().size() * 4);
         b.pAudioData = reinterpret_cast<const BYTE*>(in_flight.back().data());
         voice_->SubmitSourceBuffer(&b);
+#else
+        if (!SDL_PutAudioStreamData(stream_, mixed.data(), int(mixed.size() * sizeof(float)))) {
+          SDL_DestroyAudioStream(stream_);
+          stream_ = nullptr;
+          audio = false;
+          next = std::chrono::steady_clock::now();
+        }
+#endif
       }
     }
     return 0;
@@ -829,10 +876,14 @@ class RenderDriver {
   std::deque<std::vector<float>> queue_;
   bool started_ = false;
   rex::system::object_ref<rex::system::XHostThread> thread_;
+  float volume_ = 1.0f;
+#ifdef _WIN32
   IXAudio2* xaudio_ = nullptr;
   IXAudio2MasteringVoice* master_ = nullptr;
-  float volume_ = 1.0f;
   IXAudio2SourceVoice* voice_ = nullptr;
+#else
+  SDL_AudioStream* stream_ = nullptr;
+#endif
 };
 
 }  // namespace

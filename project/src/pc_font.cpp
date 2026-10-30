@@ -9,7 +9,14 @@
 //   size) and the LZX bytes, ended by a zero size. Every chunk is an independent LZX stream.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#ifdef _WIN32
 #include <windows.h>
+#ifndef _WIN32
+#include "platform/native_win32_posix.h"
+#endif
+#endif
+#include "platform/native_font.h"
+#include "platform/native_host_window.h"
 
 #include "pc_font.h"
 
@@ -120,7 +127,7 @@ int Weight(const Bytes& ttf) {
     size_t rec = 12 + size_t(t) * 16;
     if (BE(ttf, rec) == 0x4F532F32u) return int(BE(ttf, BE(ttf, rec + 8) + 4, 2));  // 'OS/2'
   }
-  return FW_NORMAL;
+  return 400;
 }
 
 // The family name GDI knows the font by: the 'name' table, Windows platform, name ID 1.
@@ -168,6 +175,10 @@ void LoadTtfFile(const std::filesystem::path& file, int pixels, pcs::ThemeFont& 
 }
 
 void Rasterize(const Bytes& ttf, const std::string& entry, int pixels, pcs::ThemeFont& out) {
+#ifndef _WIN32
+  native_host::RasterizeFont(ttf, pixels, out);
+  REXLOG_INFO("[pc] font {}: {} glyphs at {} px (FreeType)", entry, out.glyphs.size(), pixels);
+#else
   Require(ttf.size() > 12, "empty font");
   std::wstring family = FamilyName(ttf);
   DWORD installed = 0;
@@ -262,14 +273,13 @@ void Rasterize(const Bytes& ttf, const std::string& entry, int pixels, pcs::Them
   DeleteObject(font);
   REXLOG_INFO("[pc] font {} ({}): {} glyphs at {} px", entry, std::string(family.begin(), family.end()),
               out.glyphs.size(), pixels);
+#endif
 }
 
 }  // namespace pcfont
 
 namespace pcfont {
 std::filesystem::path ExeDir() {
-  wchar_t path[MAX_PATH];
-  DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-  return std::filesystem::path(std::wstring(path, n)).parent_path();
+  return native_host::ExecutableDirectory();
 }
 }  // namespace pcfont

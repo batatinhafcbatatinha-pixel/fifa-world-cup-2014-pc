@@ -1,3 +1,4 @@
+#include "platform/native_byteorder.h"
 // Diagnostics only (COPA_DIAG_SHADOW=1): logs the inputs of the flat-shadow matrix builder
 // sub_83024FF8 (LightWorldViewProjection, c32). The original always runs.
 #include <cstdlib>
@@ -43,6 +44,7 @@ REX_HOOK_RAW(sub_83024FF8) {
   __imp__sub_83024FF8(ctx, base);
 }
 
+#ifdef _WIN32
 // Diagnostics only (COPA_WATCH=<guest physical hex>): reports the host code that writes the
 // 4 bytes at that physical address, through any guest view (0xA/0xC/0xE0000000) or the
 // physical base, by keeping the page read-only and single-stepping each faulting write.
@@ -50,6 +52,9 @@ REX_HOOK_RAW(sub_83024FF8) {
 #define NOMINMAX
 #endif
 #include <windows.h>
+#ifndef _WIN32
+#include "platform/native_win32_posix.h"
+#endif
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -114,7 +119,7 @@ LONG CALLBACK WatchHandler(EXCEPTION_POINTERS* e) {
         auto be = [](uint32_t a) {
           uint32_t v;
           std::memcpy(&v, reinterpret_cast<const uint8_t*>(0x200000000ull + a), 4);
-          return _byteswap_ulong(v);
+          return native_host::ByteSwap32(v);
         };
         g_watch_log[n].guest_chain[0] = uint32_t(c->lr);
         uint32_t sp = c->r1.u32;
@@ -181,7 +186,7 @@ struct WatchStarter {
           std::memcpy(&now, reinterpret_cast<const void*>(g_watch_log[printed].target & ~uintptr_t(3)), 4);
           REXLOG_INFO("copa watch: access {:X} by rip={:X} ({}+{:X}) now={:08X} guest:{}", g_watch_log[printed].target,
                       g_watch_log[printed].rip, name, g_watch_log[printed].rip - uintptr_t(module),
-                      _byteswap_ulong(now), chain);
+                      native_host::ByteSwap32(now), chain);
         }
       }
     }).detach();
@@ -209,7 +214,7 @@ struct PeekStarter {
           std::memcpy(last, now, 16);
           REXLOG_INFO("copa peek {:08X} at {} ms: {:08X} {:08X} {:08X} {:08X}", address,
                       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count(),
-                      _byteswap_ulong(now[0]), _byteswap_ulong(now[1]), _byteswap_ulong(now[2]), _byteswap_ulong(now[3]));
+                      native_host::ByteSwap32(now[0]), native_host::ByteSwap32(now[1]), native_host::ByteSwap32(now[2]), native_host::ByteSwap32(now[3]));
         }
       }
     }).detach();
@@ -217,6 +222,12 @@ struct PeekStarter {
 } g_peek_starter;
 }  // namespace
 
+#else
+// Linux: the watch tools use Windows thread contexts and single-stepping; they are not built.
+#include <atomic>
+#include <mutex>
+#include <string>
+#endif
 // Diagnostics only (COPA_DIAG_POOL=1): the boot crash is a destructor (sub_836DA438) deleting a
 // garbage member: the object was already destroyed. Logs every destruction of that class and of
 // its holder (sub_82387810), with the guest call chain. The originals always run.
@@ -245,6 +256,7 @@ std::string Words(uint8_t* base, uint32_t a) {
 std::atomic<int> g_pool_logs{0};
 }  // namespace
 
+#ifdef _WIN32
 // Write watch on the held pointer (+8) of every live object of that class: page-protected,
 // writes to other addresses of the page are single-stepped through.
 namespace {
@@ -286,9 +298,9 @@ LONG CALLBACK YWatchHandler(EXCEPTION_POINTERS* e) {
                           c->r30.u32);
       uint32_t sp = c->r1.u32;
       for (int k = 0; k < 10 && sp > 0x10000 && sp < 0xF0000000u; ++k) {
-        uint32_t prev = _byteswap_ulong(*reinterpret_cast<const uint32_t*>(HostOf(sp)));
+        uint32_t prev = native_host::ByteSwap32(*reinterpret_cast<const uint32_t*>(HostOf(sp)));
         if (prev <= sp || prev - sp > 0x100000) break;
-        chain += fmt::format(" {:08X}", _byteswap_ulong(*reinterpret_cast<const uint32_t*>(HostOf(prev - 8))));
+        chain += fmt::format(" {:08X}", native_host::ByteSwap32(*reinterpret_cast<const uint32_t*>(HostOf(prev - 8))));
         sp = prev;
       }
     }
@@ -345,16 +357,16 @@ LONG CALLBACK HwbpHandler(EXCEPTION_POINTERS* e) {
                           c->r1.u32, c->r3.u32, c->r4.u32, c->r5.u32, c->r30.u32, c->r31.u32);
       uint32_t sp = c->r1.u32;
       for (int k = 0; k < 12 && sp > 0x10000 && sp < 0xF0000000u; ++k) {
-        uint32_t prev = _byteswap_ulong(*reinterpret_cast<const uint32_t*>(HostOf(sp)));
+        uint32_t prev = native_host::ByteSwap32(*reinterpret_cast<const uint32_t*>(HostOf(sp)));
         if (prev <= sp || prev - sp > 0x100000) break;
-        chain += fmt::format(" {:08X}", _byteswap_ulong(*reinterpret_cast<const uint32_t*>(HostOf(prev - 8))));
+        chain += fmt::format(" {:08X}", native_host::ByteSwap32(*reinterpret_cast<const uint32_t*>(HostOf(prev - 8))));
         sp = prev;
       }
     } else {
       chain = "(host thread)";
     }
     HMODULE exe = GetModuleHandleW(nullptr);
-    uint32_t now = _byteswap_ulong(*reinterpret_cast<const uint32_t*>(HostOf(HwbpAddress())));
+    uint32_t now = native_host::ByteSwap32(*reinterpret_cast<const uint32_t*>(HostOf(HwbpAddress())));
     REXLOG_INFO("diag HWBP write {:08X} now={:08X} thread={} rip=exe+{:X} guest {}", HwbpAddress(), now,
                 GetCurrentThreadId(), uintptr_t(e->ContextRecord->Rip) - uintptr_t(exe), chain);
   }
@@ -391,6 +403,15 @@ void ArmHwbp() {
   }).join();
 }
 }  // namespace
+
+#else
+namespace {
+uint32_t HwbpAddress() { return 0; }
+void ArmHwbp() {}
+void YWatchAdd(uint32_t) {}
+void YWatchRemove(uint32_t) {}
+}  // namespace
+#endif
 
 REX_EXTERN(__imp__sub_82387810);
 REX_HOOK_RAW(sub_82387810) {

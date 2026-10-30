@@ -1,11 +1,16 @@
+#include "../platform/native_byteorder.h"
+#include "../platform/native_host_window.h"
 // Copa 2014 native renderer (Direct3D 11). See renderer.h.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#ifndef _WIN32
+#include "../platform/native_win32_posix.h"
+#endif
 
 #include <d3d11_4.h>
-#include <d3dcompiler.h>
+#include "../platform/native_shader_compiler.h"
 #include <dxgi1_2.h>
 
 #include <algorithm>
@@ -34,6 +39,9 @@
 #include <rex/system/thread_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/window.h>
+#ifndef _WIN32
+#include <rex/exception_handler.h>
+#endif
 
 #include "renderer.h"
 #include "post_effects.h"
@@ -759,6 +767,7 @@ class RendererImpl {
 // --------------------------------------------------------------------------- device
 RendererImpl* g_ondemand_owner = nullptr;
 
+#ifdef _WIN32
 LONG CALLBACK OnDemandFaultHandler(EXCEPTION_POINTERS* e) {
   if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || !g_ondemand_owner)
     return EXCEPTION_CONTINUE_SEARCH;
@@ -785,7 +794,7 @@ LONG CALLBACK OnDemandFaultHandler(EXCEPTION_POINTERS* e) {
         auto be = [&](uint32_t a) {
           uint32_t v;
           std::memcpy(&v, reinterpret_cast<const uint8_t*>(base) + a, 4);
-          return _byteswap_ulong(v);
+          return native_host::ByteSwap32(v);
         };
         std::string chain;
         uint32_t sp = c->r1.u32;
@@ -804,6 +813,13 @@ LONG CALLBACK OnDemandFaultHandler(EXCEPTION_POINTERS* e) {
              ? EXCEPTION_CONTINUE_EXECUTION
              : EXCEPTION_CONTINUE_SEARCH;
 }
+#else
+// Linux: the SDK's host exception handler (SIGSEGV) reports the faulting address the same way.
+bool OnDemandFaultLinux(rex::arch::Exception* ex, void*) {
+  if (ex->code() != rex::arch::Exception::Code::kAccessViolation || !g_ondemand_owner) return false;
+  return g_ondemand_owner->HandleOnDemandFault(uintptr_t(ex->fault_address()));
+}
+#endif
 
 bool RendererImpl::EnsureDevice() {
   if (device_) return EnsureSwapChain();
@@ -813,7 +829,7 @@ bool RendererImpl::EnsureDevice() {
   membase_ = runtime->memory()->virtual_membase();
   physbase_ = runtime->memory()->physical_membase();
   if (auto* window = runtime->display_window())
-    hwnd_ = static_cast<HWND>(window->GetNativeWindowHandle());
+    hwnd_ = static_cast<HWND>(native_host::WindowHandle(window));
   if (!hwnd_) return false;
 
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -836,9 +852,17 @@ bool RendererImpl::EnsureDevice() {
                                          reinterpret_cast<void**>(multithread.put()))))
     multithread->SetMultithreadProtected(TRUE);
   g_ondemand_owner = this;
+#ifdef _WIN32
   AddVectoredExceptionHandler(1, OnDemandFaultHandler);
+#else
+  rex::arch::ExceptionHandler::Install(OnDemandFaultLinux, nullptr);
+#endif
+#ifdef _WIN32
   HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
   if (compiler) compile_ = reinterpret_cast<D3DCompileFn>(GetProcAddress(compiler, "D3DCompile"));
+#else
+  compile_ = &D3DCompile;
+#endif
   if (!compile_) {
     REXLOG_ERROR("copa renderer: d3dcompiler_47.dll not available");
     device_failed_ = true;
@@ -848,6 +872,9 @@ bool RendererImpl::EnsureDevice() {
                                              : runtime->cache_root();
   cache_dir_ /= "copa_shaders";
   std::error_code ec;
+#ifndef _WIN32
+  cache_dir_ /= "vkd3d";
+#endif
   std::filesystem::create_directories(cache_dir_, ec);
 
   auto make_cb = [&](Com<ID3D11Buffer>& b, UINT size) {
@@ -2670,7 +2697,7 @@ void RendererImpl::StoreTiled(const uint8_t* data, uint32_t row_pitch, uint32_t 
         uint32_t v[4];
         std::memcpy(v, src_row + size_t(col) * 4, 16);
         if (endian == 2)
-          for (uint32_t& t : v) t = _byteswap_ulong(t);
+          for (uint32_t& t : v) t = native_host::ByteSwap32(t);
         std::memcpy(mem + off, v, 16);
         col += n;
         continue;
@@ -2699,7 +2726,7 @@ void RendererImpl::StoreTiled(const uint8_t* data, uint32_t row_pitch, uint32_t 
           for (uint32_t i = 0; i < bytes; i += 4) {
             uint32_t v;
             std::memcpy(&v, src + i, 4);
-            v = _byteswap_ulong(v);
+            v = native_host::ByteSwap32(v);
             std::memcpy(dst + i, &v, 4);
           }
         } else {  // 16in32

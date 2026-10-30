@@ -1,3 +1,4 @@
+#include "platform/native_byteorder.h"
 // Copa 2014 - kernel exports not provided by the ReXGlue SDK.
 #include <cstdlib>
 #include <cstring>
@@ -22,7 +23,7 @@ REX_HOOK_RAW(sub_8394EC28) {
   const uint32_t count = ctx.r4.u32, size_ptr = ctx.r5.u32;
   __imp__sub_8394EC28(ctx, base);
   if (ctx.r3.u32 != 0 && size_ptr && copa::LoadBE32(copa::GuestPtr(base, size_ptr)) == 0) {
-    const uint32_t size = _byteswap_ulong(count * 820);
+    const uint32_t size = native_host::ByteSwap32(count * 820);
     std::memcpy(copa::GuestPtr(base, size_ptr), &size, 4);
     static bool logged = false;
     if (!logged) REXLOG_INFO("copa: XHV engine unavailable; voice buffer size set to {} bytes", count * 820);

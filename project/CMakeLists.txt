@@ -51,10 +51,17 @@ rexglue_setup_target(copa2014)
 
 # XMA decoding with the SDK's prebuilt libavcodec (Xenia FFmpeg fork); headers from the
 # matching commit in third_party/ffmpeg.
-target_include_directories(copa2014 PRIVATE ../third_party/ffmpeg)
-find_library(COPA_AVCODEC NAMES libavcodecrd libavcodec PATHS ${CMAKE_PREFIX_PATH}/lib NO_DEFAULT_PATH)
-find_library(COPA_AVUTIL NAMES libavutilrd libavutil PATHS ${CMAKE_PREFIX_PATH}/lib NO_DEFAULT_PATH)
-target_link_libraries(copa2014 PRIVATE ${COPA_AVCODEC} ${COPA_AVUTIL})
+if(WIN32)
+    target_include_directories(copa2014 PRIVATE ../third_party/ffmpeg)
+    find_library(COPA_AVCODEC NAMES libavcodecrd libavcodec PATHS ${CMAKE_PREFIX_PATH}/lib NO_DEFAULT_PATH)
+    find_library(COPA_AVUTIL NAMES libavutilrd libavutil PATHS ${CMAKE_PREFIX_PATH}/lib NO_DEFAULT_PATH)
+    target_link_libraries(copa2014 PRIVATE ${COPA_AVCODEC} ${COPA_AVUTIL})
+else()
+    # The same Xenia FFmpeg fork as on Windows (the system FFmpeg has no XMA decoder).
+    target_include_directories(copa2014 PRIVATE ../third_party/ffmpeg)
+    find_package(SDL3 REQUIRED CONFIG)
+    target_link_libraries(copa2014 PRIVATE rex::libavcodec rex::libavutil SDL3::SDL3)
+endif()
 if(WIN32)
     target_link_libraries(copa2014 PRIVATE d3d11 dxgi xaudio2 ole32 bcrypt)
 endif()
@@ -70,7 +77,9 @@ endif()
 if(TARGET copa2014_powdllzf_xex)
     target_sources(copa2014_powdllzf_xex PRIVATE src/pow_hooks.cpp src/pc_settings.cpp src/pc_theme.cpp src/pc_font.cpp)
     target_include_directories(copa2014_powdllzf_xex PRIVATE src src/native)
-    target_link_libraries(copa2014_powdllzf_xex PRIVATE d3d11 dxgi)
+    if(WIN32)
+        target_link_libraries(copa2014_powdllzf_xex PRIVATE d3d11 dxgi)
+    endif()
 endif()
 
 # DLL sources are emitted by the shared codegen command but are not listed as
@@ -98,4 +107,14 @@ if(WIN32 AND EXISTS "${DXVK_DIR}/x64/d3d11.dll")
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/LICENSE"
                     "$<TARGET_FILE_DIR:copa2014>/vulkan/LICENSE.dxvk.txt")
     endif()
+endif()
+
+# Native HLSL compiler for Linux (no Windows compiler DLL).
+include(src/platform/native_shader_compiler.cmake)
+if(TARGET native_shader_compiler)
+    foreach(_native_target IN ITEMS copa2014 copa2014_powdllzf_xex)
+        if(TARGET ${_native_target})
+            target_link_libraries(${_native_target} PRIVATE native_shader_compiler)
+        endif()
+    endforeach()
 endif()
