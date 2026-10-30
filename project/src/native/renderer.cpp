@@ -331,6 +331,14 @@ struct RenderTarget {
   uint64_t last_used = 0;
 };
 
+// CPU write watch of guest memory a cached copy came from (RendererImpl::ValidateWatched).
+struct WriteWatchState {
+  uint64_t gen = 0;    // sum of the page generations when the pages were protected
+  uint32_t quiet = 0;  // consecutive validations without a change
+  uint32_t need = 2;   // unchanged validations before protecting (doubles on false alarms)
+  bool armed = false;
+};
+
 struct HostTexture {
   std::vector<uint8_t> validation_bytes;
   TextureDesc desc;
@@ -341,6 +349,7 @@ struct HostTexture {
   uint64_t sample_hash = 0;
   uint64_t validated_frame = ~0ull;
   uint64_t last_used = 0;
+  WriteWatchState watch;
   bool cube = false;
   uint32_t array_size = 1;
 };
@@ -356,6 +365,15 @@ struct ResolvedTexture {
   bool bgra = false;  // an 8_8_8_8 color resolve, stored as BGRA like guest memory
 };
 
+// Converted guest index buffer (byte-swapped, primitive reset as 0xFFFFFFFF, base vertex added),
+// kept while the guest indices stay the same.
+struct IndexBufferEntry {
+  std::vector<uint8_t> raw;  // the guest bytes it was converted from
+  Com<ID3D11Buffer> buffer;
+  WriteWatchState watch;
+  uint64_t last_used = 0;
+};
+
 struct VertexBufferEntry {
   std::vector<uint8_t> validation_bytes;
   Com<ID3D11Buffer> buffer;
@@ -364,6 +382,7 @@ struct VertexBufferEntry {
   uint64_t hash = 0;
   uint64_t validated_frame = ~0ull;
   uint64_t last_used = 0;
+  WriteWatchState watch;
 };
 
 class RendererImpl {
@@ -471,6 +490,19 @@ class RendererImpl {
   std::filesystem::path cache_dir_;
   uint8_t* membase_ = nullptr;
   uint8_t* physbase_ = nullptr;
+  // CPU write watch: page generations bumped by the memory system's write-protection
+  // callbacks, so unchanged cached textures / vertex / index buffers skip the byte comparison.
+  static constexpr uint32_t kWatchPageShift = 12;
+  static constexpr uint32_t kWatchPages = 0x20000000u >> kWatchPageShift;
+  rex::memory::Memory* memory_ = nullptr;
+  std::unique_ptr<std::atomic<uint32_t>[]> write_gen_;
+  void* watch_handle_ = nullptr;
+  bool write_watch_ = false, write_watch_check_ = false;
+  uint64_t watch_misses_ = 0;
+  static std::pair<uint32_t, uint32_t> OnInvalidate(void* context, uint32_t start, uint32_t length, bool);
+  uint64_t WriteGen(uint32_t address, uint32_t size) const;
+  template <typename F>
+  bool ValidateWatched(WriteWatchState& w, uint32_t address, uint32_t size, const char* what, F&& changed_fn);
   uint64_t frame_ = 0;
   float scale_ = 1.0f;  // internal resolution (pcs::ResolutionScale), re-read after each frame
   // Guest-size copies of scaled resolve results on their way to guest memory, by destination.
@@ -738,6 +770,9 @@ class RendererImpl {
  private:
   std::vector<Com<ID3D11Texture2D>> staging_pool_;
   std::unordered_map<uint64_t, std::unique_ptr<VertexBufferEntry>> vertex_buffers_;
+  std::unordered_map<uint64_t, std::unique_ptr<IndexBufferEntry>> index_buffers_;
+  ID3D11Buffer* cached_ib_ = nullptr;  // set by BuildIndices when the draw uses a cached buffer
+  uint32_t cached_index_count_ = 0;
   std::vector<std::unique_ptr<VertexBufferEntry>> transient_vbs_;
   size_t transient_next_ = 0;
   std::unordered_map<uint64_t, Com<ID3D11SamplerState>> samplers_;
@@ -828,6 +863,16 @@ bool RendererImpl::EnsureDevice() {
   if (!runtime) return false;
   membase_ = runtime->memory()->virtual_membase();
   physbase_ = runtime->memory()->physical_membase();
+  // COPA_NO_WRITE_WATCH=1: compare the bytes of every cached texture / vertex buffer each
+  // frame as before. COPA_WRITE_WATCH_CHECK=1: compare anyway and log watch misses.
+  if (!std::getenv("COPA_NO_WRITE_WATCH")) {
+    memory_ = runtime->memory();
+    write_gen_ = std::make_unique<std::atomic<uint32_t>[]>(kWatchPages);
+    for (uint32_t p = 0; p < kWatchPages; ++p) write_gen_[p].store(1, std::memory_order_relaxed);
+    watch_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(&RendererImpl::OnInvalidate, this);
+    write_watch_ = watch_handle_ != nullptr;
+    write_watch_check_ = std::getenv("COPA_WRITE_WATCH_CHECK") != nullptr;
+  }
   if (auto* window = runtime->display_window())
     hwnd_ = static_cast<HWND>(native_host::WindowHandle(window));
   if (!hwnd_) return false;
@@ -1253,9 +1298,9 @@ ID3D11ShaderResourceView* RendererImpl::GetTexture(const uint32_t fetch[6], Text
     return h;
   };
   if (slot && slot->validated_frame != frame_) {
-    bool changed = exact_compare
-      ? !same_texture_bytes(slot->validation_bytes)
-      : sample_hash() != slot->sample_hash;
+    bool changed = ValidateWatched(slot->watch, source_address, extent, "texture", [&] {
+      return exact_compare ? !same_texture_bytes(slot->validation_bytes) : sample_hash() != slot->sample_hash;
+    });
     if (changed) slot.reset();
     else slot->validated_frame = frame_;
     texture_reloaded_ = changed;
@@ -1464,6 +1509,61 @@ void RendererImpl::UpdateDynamicBuffer(Com<ID3D11Buffer>& buffer, uint32_t& capa
   }
 }
 
+// --------------------------------------------------------------------------- write watch
+std::pair<uint32_t, uint32_t> RendererImpl::OnInvalidate(void* context, uint32_t start, uint32_t length, bool) {
+  auto* self = static_cast<RendererImpl*>(context);
+  const uint32_t first = start >> kWatchPageShift;
+  const uint32_t last =
+      uint32_t(std::min<uint64_t>((uint64_t(start) + length + (1u << kWatchPageShift) - 1) >> kWatchPageShift, kWatchPages));
+  for (uint32_t p = first; p < last; ++p) self->write_gen_[p].fetch_add(1, std::memory_order_relaxed);
+  // Only the touched pages may be unprotected: (0, UINT32_MAX) would drop every other watch.
+  return {first << kWatchPageShift, (last - first) << kWatchPageShift};
+}
+
+uint64_t RendererImpl::WriteGen(uint32_t address, uint32_t size) const {
+  const uint32_t start = address & 0x1FFFFFFF;
+  const uint32_t first = start >> kWatchPageShift;
+  const uint32_t last =
+      uint32_t(std::min<uint64_t>((uint64_t(start) + size + (1u << kWatchPageShift) - 1) >> kWatchPageShift, kWatchPages));
+  uint64_t sum = 0;
+  for (uint32_t p = first; p < last; ++p) sum += write_gen_[p].load(std::memory_order_relaxed);
+  return sum;
+}
+
+// Validates a cached copy of guest memory; changed_fn compares the bytes. A copy that stayed
+// unchanged for a while gets its pages write-protected, and until the CPU writes there again
+// the comparison is skipped. The pages are protected before the generation is read and the
+// bytes compared, so a write racing the comparison still bumps the generation. Copies whose
+// pages the CPU rewrites without changing them (same bytes, or neighbours on the same pages)
+// back off before being protected again.
+template <typename F>
+bool RendererImpl::ValidateWatched(WriteWatchState& w, uint32_t address, uint32_t size, const char* what,
+                                   F&& changed_fn) {
+  if (w.armed && WriteGen(address, size) == w.gen) {
+    if (!write_watch_check_ || !changed_fn()) return false;
+    REXLOG_WARN("copa write watch MISS #{}: {} {:08X} ({} bytes)", ++watch_misses_, what, address, size);
+    w.armed = false;
+    return true;
+  }
+  const bool arm = write_watch_ && size && !w.armed && w.quiet + 1 >= w.need;
+  if (arm) memory_->EnablePhysicalMemoryAccessCallbacks(address & 0x1FFFFFFF, size, true, false);
+  const uint64_t gen = arm ? WriteGen(address, size) : 0;
+  const bool changed = changed_fn();
+  if (changed) {
+    w.quiet = 0;
+    w.armed = false;
+  } else if (w.armed) {
+    w.need = std::min<uint32_t>(w.need * 2, 64);
+    w.quiet = 0;
+    w.armed = false;
+  } else {
+    ++w.quiet;
+    w.armed = arm;
+    w.gen = gen;
+  }
+  return changed;
+}
+
 ID3D11ShaderResourceView* RendererImpl::GetVertexBuffer(uint32_t physical, uint32_t bytes,
                                                         bool cacheable, const uint8_t* host) {
   RenderPhase profile(RenderProfile::Vertex);
@@ -1496,24 +1596,17 @@ ID3D11ShaderResourceView* RendererImpl::GetVertexBuffer(uint32_t physical, uint3
   // Dynamic geometry may reuse the same guest allocation between draws.
   // A frame number isn't a content version.
   static const bool compare_vertices = !std::getenv("COPA_NO_VERTEX_COMPARE");
-  if (compare_vertices && bytes <= 1024 * 1024) {
-    // Byte-exact comparison: cheaper than hashing, no collisions.
-    if (!e.srv || e.validation_bytes.size() != bytes ||
-        std::memcmp(e.validation_bytes.data(), host, bytes) != 0) {
-      fill(e);
-      e.validation_bytes.assign(host, host + bytes);
-    }
-  } else {
-    uint64_t h = Hash64(host, bytes);
-    if (e.srv && h != e.hash && e.validated_frame == frame_) {
-      static uint32_t changed_logs = 0;
-      if (changed_logs++ < 8)
-        REXLOG_INFO("copa vertex refresh within frame: address={:08X} bytes={} frame={}", physical, bytes, frame_);
-    }
-    if (!e.srv || h != e.hash) {
-      fill(e);
-      e.hash = h;
-    }
+  // Byte-exact comparison (cheaper than hashing, no collisions), skipped while the write watch
+  // shows the guest pages untouched.
+  const bool exact = compare_vertices && bytes <= 1024 * 1024;
+  const bool changed = !e.srv || ValidateWatched(e.watch, physical, bytes, "vertices", [&] {
+    return exact ? e.validation_bytes.size() != bytes || std::memcmp(e.validation_bytes.data(), host, bytes) != 0
+                 : Hash64(host, bytes) != e.hash;
+  });
+  if (changed) {
+    fill(e);
+    if (exact) e.validation_bytes.assign(host, host + bytes);
+    else e.hash = Hash64(host, bytes);
   }
   e.validated_frame = frame_;
   return e.srv.get();
@@ -1526,6 +1619,7 @@ bool RendererImpl::BuildIndices(const DrawRequest& draw, D3D11_PRIMITIVE_TOPOLOG
   RenderPhase profile(RenderProfile::Indices);
   out.clear();
   rect_list = false;
+  cached_ib_ = nullptr;
   uint32_t n = draw.count;
   if (!n) return false;
   static const bool direct_draw = !std::getenv("COPA_NO_DIRECT_DRAW");
@@ -1546,6 +1640,57 @@ converted_indices:
   src.resize(n);
   bool reset_enabled = (dev.reg(0x2205) >> 21) & 1;  // PA_SU_SC_MODE_CNTL.multi_prim_ib_ena
   uint32_t reset_index = dev.reg(0x2103) & 0xFFFFFF;
+  // Indexed lists/strips: the converted buffer is cached per guest range, base vertex and reset
+  // index, revalidated against the guest bytes (write watch). COPA_NO_INDEX_CACHE=1: convert
+  // and upload on every draw as before.
+  static const bool cache_indices = direct_draw && !std::getenv("COPA_NO_INDEX_CACHE");
+  const bool direct_topology = draw.primitive == 1 || draw.primitive == 2 || draw.primitive == 3 ||
+                               draw.primitive == 4 || draw.primitive == 6;
+  if (cache_indices && draw.indexed && direct_topology && n <= (1u << 20)) {
+    if (!ValidGuest(draw.index_address)) return false;
+    const uint8_t* p = Virtual(draw.index_address);
+    const uint32_t bytes = n * (draw.index32 ? 4 : 2);
+    const uint32_t physical = VirtualToPhysical(draw.index_address);
+    const uint64_t params[] = {physical, n, uint64_t(draw.index32) | uint64_t(reset_enabled) << 1,
+                               reset_index, uint64_t(uint32_t(draw.base_vertex))};
+    auto& slot = index_buffers_[Hash64(params, sizeof(params))];
+    if (!slot) slot = std::make_unique<IndexBufferEntry>();
+    auto& e = *slot;
+    e.last_used = frame_;
+    const bool changed = !e.buffer || e.raw.size() != bytes ||
+                         ValidateWatched(e.watch, physical, bytes, "indices",
+                                         [&] { return std::memcmp(e.raw.data(), p, bytes) != 0; });
+    if (changed) {
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t v = draw.index32 ? LoadBE32(p + i * 4) : LoadBE16(p + i * 2);
+        bool is_reset = reset_enabled && (draw.index32 ? (v & 0xFFFFFF) == reset_index
+                                                       : v == (reset_index & 0xFFFF));
+        src[i] = is_reset ? 0xFFFFFFFFu : uint32_t(int32_t(v) + draw.base_vertex);
+      }
+      if (e.buffer && e.raw.size() == bytes) {
+        context_->UpdateSubresource(e.buffer.get(), 0, nullptr, src.data(), 0, 0);
+      } else {
+        D3D11_BUFFER_DESC d{};
+        d.ByteWidth = n * 4;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA init{src.data(), 0, 0};
+        if (FAILED(device_->CreateBuffer(&d, &init, e.buffer.put()))) return false;
+      }
+      e.raw.assign(p, p + bytes);
+    }
+    switch (draw.primitive) {
+      case 1: topology = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
+      case 2: topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
+      case 3: topology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
+      case 4: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; break;
+      default: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+    }
+    cached_ib_ = e.buffer.get();
+    cached_index_count_ = n;
+    use_indices = true;
+    return true;
+  }
   if (draw.indexed) {
     if (!ValidGuest(draw.index_address)) return false;
     const uint8_t* p = Virtual(draw.index_address);
@@ -1816,7 +1961,11 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
                   draw.indexed, draw.index_address, draw.index32);
     return;
   }
-  if (use_indices) {
+  ID3D11Buffer* const cached_ib = cached_ib_;
+  const UINT index_count = cached_ib ? cached_index_count_ : UINT(indices.size());
+  if (cached_ib) {
+    context_->IASetIndexBuffer(cached_ib, DXGI_FORMAT_R32_UINT, 0);
+  } else if (use_indices) {
     UpdateDynamicBuffer(index_buffer_, index_capacity_, D3D11_BIND_INDEX_BUFFER, indices.data(),
                         uint32_t(indices.size() * 4));
     context_->IASetIndexBuffer(index_buffer_.get(), DXGI_FORMAT_R32_UINT, 0);
@@ -2158,7 +2307,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
     std::memcpy(pitch_vsc_[frame_ % 3].data(), alu.data(), 1024 * 4);
     pitch_vsc_frame_[frame_ % 3] = frame_;
   }
-  if (use_indices) context_->DrawIndexed(UINT(indices.size()), 0, 0);
+  if (use_indices) context_->DrawIndexed(index_count, 0, 0);
   else context_->Draw(draw.count, draw.first_vertex);
   if (pitch_draw) {
     CapturePitch(pitch_cap_[mask_snap_cur_][1], bound_color_[0], bound_depth_);
@@ -3428,6 +3577,8 @@ void RendererImpl::Present(const uint8_t* fetch) {
       it = (frame_ - it->second->last_used > 600) ? textures_.erase(it) : std::next(it);
     for (auto it = vertex_buffers_.begin(); it != vertex_buffers_.end();)
       it = (frame_ - it->second->last_used > 600) ? vertex_buffers_.erase(it) : std::next(it);
+    for (auto it = index_buffers_.begin(); it != index_buffers_.end();)
+      it = (frame_ - it->second->last_used > 600) ? index_buffers_.erase(it) : std::next(it);
   }
 }
 

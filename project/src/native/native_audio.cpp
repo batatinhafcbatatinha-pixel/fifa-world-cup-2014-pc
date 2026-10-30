@@ -774,6 +774,9 @@ class RenderDriver {
     std::deque<std::vector<float>> in_flight;
     auto next = std::chrono::steady_clock::now();
     auto next_log = next;
+    auto last_progress = next;
+    uint32_t last_queued = 0;
+    bool was_stalled = false;
     while (true) {
       if (std::chrono::steady_clock::now() >= next_log) {
         next_log += std::chrono::seconds(2);
@@ -819,7 +822,21 @@ class RenderDriver {
         }
 #endif
       }
-      bool need = audio ? queued < 3 : std::chrono::steady_clock::now() >= next;
+      // An endpoint that stops consuming (a TV or HDMI receiver switched off) leaves the
+      // queue full forever, and the game waits on its mixer callbacks: after 200 ms without
+      // progress, pace by the clock and drop the output until the device plays again.
+      const auto now = std::chrono::steady_clock::now();
+      if (audio) {
+        if (queued < last_queued || queued < 3) last_progress = now;
+        last_queued = queued;
+      }
+      const bool stalled = audio && now - last_progress > std::chrono::milliseconds(200);
+      if (stalled != was_stalled) {
+        was_stalled = stalled;
+        if (stalled) next = now;
+        REXLOG_WARN("copa audio: output device {}", stalled ? "stalled, pacing by the clock" : "playing again");
+      }
+      bool need = audio && !stalled ? queued < 3 : now >= next;
       if (!need) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
@@ -850,7 +867,7 @@ class RenderDriver {
       for (auto& f : frames)
         for (size_t i = 0; i < mixed.size(); ++i) mixed[i] += f[i];
       for (auto& v : mixed) v = std::clamp(v, -1.0f, 1.0f);
-      if (audio) {
+      if (audio && !stalled) {
 #ifdef _WIN32
         in_flight.push_back(std::move(mixed));
         XAUDIO2_BUFFER b{};
