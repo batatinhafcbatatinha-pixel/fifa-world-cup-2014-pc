@@ -15,7 +15,7 @@ An experimental port of the Xbox 360 game *2014 FIFA World Cup Brazil* (Copa do 
 - Graphics: the game's Direct3D library is hooked at the API level and drawn by a native Direct3D 11 renderer; Xenos shader microcode is translated to HLSL SM5; textures are untiled and converted on load. Render-to-texture results the CPU reads (crowd sprite atlases, generated lightmaps) are written back to game memory when the game touches them. No GPU command processor or emulation plugin.
 - Audio: XMA contexts are decoded with FFmpeg's XMA decoder and mixed natively. No audio hardware model.
 - The Xbox 360 kernel and XAM services come from the ReXGlue runtime as an operating-system compatibility layer. Online features are not supported.
-- Known issues: crashes and occasional one-frame graphical glitches may remain. Windows x64 only.
+- Known issues: crashes and occasional one-frame graphical glitches may remain. Tested on Windows x64; a Linux build path exists. Experimental [macOS](MACOS.md) build files are included; they have not been compiled or run yet.
 
 ## Why a native port instead of an emulator
 
@@ -72,6 +72,10 @@ python3 tools/play.py --game-files game_files
 ```
 
 The build copies the SDK runtime, DXVK native and vkd3d-shader next to the executable (it finds them there).
+
+## Build on macOS
+
+Experimental and not compiled or run yet: see [MACOS.md](MACOS.md).
 
 ## Keyboard controls
 
