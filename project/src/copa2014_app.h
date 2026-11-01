@@ -76,5 +76,6 @@ class Copa2014App : public rex::ReXApp {
         -> std::unique_ptr<rex::system::IAudioSystem> {
       return std::make_unique<copa::NativeAudioSystem>();
     };
+    pcs::InstallPadTap(config);
   }
 };

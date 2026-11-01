@@ -45,6 +45,10 @@ dlc/dlc_FootballCompEng/dlc/FootballCompEng/FootballCompEngzf.xex.dll  7888f6c73
 
 Do not upload the ISO, extracted files, generated code or the built executables.
 
+## Controllers
+
+Xbox pads and every pad SDL knows work in the game and in the PC settings menu: DualShock 3/4, DualSense, Switch pads, USB adapters for PS2 and original Xbox pads. `tools/build_local.py` downloads `gamecontrollerdb.txt` (SDL_GameControllerDB, zlib license) next to the executable, so generic adapters get their button names. Only Xbox-type input was tested; no PlayStation pad or adapter has been tried on real hardware yet.
+
 ## Build on Windows
 
 Requirements: Python 3.10+, Visual Studio 2022 Build Tools (C++ workload, Windows SDK), LLVM/Clang 20 or newer (a complete install that includes the clang resource headers), CMake 3.25+ and Ninja.

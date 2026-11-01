@@ -26,6 +26,7 @@
 #include <future>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -867,6 +868,18 @@ class RenderDriver {
       for (auto& f : frames)
         for (size_t i = 0; i < mixed.size(); ++i) mixed[i] += f[i];
       for (auto& v : mixed) v = std::clamp(v, -1.0f, 1.0f);
+      static const bool peak_log = std::getenv("COPA_AUDIO_LOG") != nullptr;
+      if (peak_log) {
+        static float peak = 0.0f;
+        static uint32_t blocks = 0, frames_seen = 0;
+        for (float v : mixed) peak = std::max(peak, std::fabs(v));
+        frames_seen += uint32_t(frames.size());
+        if (++blocks == 188) {
+          REXLOG_INFO("copa audio mix: peak {:.4f} submitted frames {} of {} blocks", peak, frames_seen, blocks);
+          peak = 0.0f;
+          blocks = frames_seen = 0;
+        }
+      }
       if (audio && !stalled) {
 #ifdef _WIN32
         in_flight.push_back(std::move(mixed));
