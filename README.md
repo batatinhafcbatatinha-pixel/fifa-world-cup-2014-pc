@@ -13,7 +13,8 @@ An experimental port of the Xbox 360 game *2014 FIFA World Cup Brazil* (Copa do 
 
 - Reached on Windows 11 x64 with the native renderer: boot, menus, Kick Off (team, kit and stadium selection) and full matches, and the Skill Games.
 - Graphics: the game's Direct3D library is hooked at the API level and drawn by a native Direct3D 11 renderer; Xenos shader microcode is translated to HLSL SM5; textures are untiled and converted on load. Render-to-texture results the CPU reads (crowd sprite atlases, generated lightmaps) are written back to game memory when the game touches them. No GPU command processor or emulation plugin.
-- Audio: XMA contexts are decoded with FFmpeg's XMA decoder and mixed natively. No audio hardware model.
+- Audio: XMA contexts are decoded with FFmpeg's XMA decoder and mixed natively. No audio hardware model. The game's own audio only started playing with a decoder fix on 2026-11-01: a loopback capture of menus and a Skill Game has no silent stretches, but the level is low (about -35 dB RMS against -17 to -28 dB in the other ports) and nobody has reviewed it by ear.
+- Performance in a Skill Game at 4K with 16x anisotropic filtering and no frame limit (Ryzen 5 3600, RTX 3050 Laptop): about 168 fps without MSAA, 114 with 2x, 101 with 4x, 75 with 8x.
 - The Xbox 360 kernel and XAM services come from the ReXGlue runtime as an operating-system compatibility layer. Online features are not supported.
 - Known issues: crashes and occasional one-frame graphical glitches may remain. Tested on Windows x64; a Linux build path exists. Experimental [macOS](MACOS.md) build files are included; they have not been compiled or run yet.
 
