@@ -306,6 +306,14 @@ float ps_depth(O i) : SV_Target { return src.SampleLevel(samp, i.uv, 0).r; }
 // MSAA depth to a single-sample float texture (sample 0), drawn over the whole target.
 Texture2DMS<float4> src_ms : register(t0);
 float ps_depth_ms(O i) : SV_Target { return src_ms.Load(int2(i.pos.xy), 0).r; }
+// MSAA color, average of the samples: same result as ResolveSubresource, for one rectangle.
+float4 ps_color_ms(O i) : SV_Target {
+  uint w, h, n;
+  src_ms.GetDimensions(w, h, n);
+  float4 c = 0;
+  for (uint k = 0; k < n; ++k) c += src_ms.Load(int2(i.pos.xy), k);
+  return c / float(n);
+}
 )HLSL";
 
 struct ShaderEntry {
@@ -329,7 +337,10 @@ struct RenderTarget {
   Com<ID3D11RenderTargetView> rtv;
   Com<ID3D11DepthStencilView> dsv;
   Com<ID3D11ShaderResourceView> srv;
-  // MSAA: single-sample copy for resolves (RendererImpl::SingleSampleSrv).
+  // MSAA: single-sample copy for resolves (RendererImpl::SingleSampleSrv), current unless the
+  // target was drawn to or cleared since (tiled frames resolve the same surface several times).
+  bool single_stale = true;
+  uint64_t single_epoch = 0;
   Com<ID3D11Texture2D> single;
   Com<ID3D11ShaderResourceView> single_srv;
   Com<ID3D11RenderTargetView> single_rtv;
@@ -389,6 +400,14 @@ struct VertexBufferEntry {
   uint64_t last_used = 0;
   WriteWatchState watch;
 };
+
+// The D3D11 immediate context is single-threaded; CPU waits (FlushWriteBacks) can come from
+// threads other than the one issuing the draws.
+static std::recursive_mutex& ApiMutex() {
+  static std::recursive_mutex m;
+  return m;
+}
+using ApiLock = std::lock_guard<std::recursive_mutex>;
 
 class RendererImpl {
  public:
@@ -452,11 +471,12 @@ class RendererImpl {
               ID3D11ShaderResourceView* src, float src_w, float src_h, float u0, float v0,
               float u1, float v1, bool depth, bool swap_rb = false, bool point = false,
               ID3D11PixelShader* shader = nullptr);
-  ID3D11ShaderResourceView* SingleSampleSrv(RenderTarget& rt);
+  ID3D11ShaderResourceView* SingleSampleSrv(RenderTarget& rt, const D3D11_RECT* part = nullptr);
   // MSAA (PC settings, live) on the targets the internal resolution scales; resolves read a
   // single-sample copy (SingleSampleSrv).
   uint32_t msaa_ = 1, msaa_wanted_ = 0, bound_samples_ = 1;
   uint32_t SamplesFor(uint32_t width) const { return width >= 640 ? msaa_ : 1; }
+  uint64_t single_copied_ = 0, single_reused_ = 0, rect_resolves_ = 0, tile_depth_clear_epoch_ = 0;
   void UpdateMsaa() {
     uint32_t want = uint32_t(pcs::MsaaSamples());
     if (want == msaa_wanted_) return;
@@ -703,6 +723,7 @@ class RendererImpl {
     uint64_t area = 0;
   } tile_depth_clear_;
   void FlushTileDepthClear() {
+    if (tile_depth_clear_.dsv) ++tile_depth_clear_epoch_;
     if (tile_depth_clear_.dsv)
       context_->ClearDepthStencilView(tile_depth_clear_.dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                       tile_depth_clear_.z, tile_depth_clear_.stencil);
@@ -749,7 +770,10 @@ class RendererImpl {
   // guest pages they cover stay inaccessible in the CPU views until the CPU touches them, and
   // that access stores the latest resolve first (HandleOnDemandFault).
   struct OnDemandWriteBack {
-    Com<ID3D11Texture2D> texture;
+    Com<ID3D11Texture2D> texture;  // the resolve destination, at internal resolution
+    Com<ID3D11ShaderResourceView> srv;
+    uint32_t width = 0, height = 0;
+    float scale = 1.0f;
     uint32_t dest_base = 0, dest_pitch = 0, endian = 0, bpp = 0;
     bool pack4444 = false;
     int32_t x = 0, y = 0, w = 0, h = 0;
@@ -768,6 +792,7 @@ class RendererImpl {
   void StoreOnDemand(OnDemandWriteBack& od);
   void ExpireOnDemand();
   bool OnDemandStored(uint32_t base, uint64_t guest_hash);
+  bool OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address);
 
  public:
   bool HandleOnDemandFault(uintptr_t host_address);
@@ -793,7 +818,7 @@ class RendererImpl {
   uint32_t index_capacity_ = 0;
   Com<ID3D11GeometryShader> rect_gs_;
   Com<ID3D11VertexShader> blit_vs_;
-  Com<ID3D11PixelShader> blit_ps_, blit_depth_ps_, blit_depth_ms_ps_;
+  Com<ID3D11PixelShader> blit_ps_, blit_depth_ps_, blit_depth_ms_ps_, blit_color_ms_ps_;
   Com<ID3D11SamplerState> linear_clamp_, point_clamp_;
   Com<ID3D11RasterizerState> blit_raster_;
   Com<ID3D11DepthStencilState> no_depth_;
@@ -956,6 +981,8 @@ bool RendererImpl::EnsureDevice() {
     device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_depth_ps_.put());
   if (Compile(kBlitHlsl, "ps_depth_ms", "ps_5_0", code, internal(kBlitHlsl, "blit_depth_ms_ps")))
     device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_depth_ms_ps_.put());
+  if (Compile(kBlitHlsl, "ps_color_ms", "ps_5_0", code, internal(kBlitHlsl, "blit_color_ms_ps")))
+    device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_color_ms_ps_.put());
 
   D3D11_SAMPLER_DESC sd{};
   sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -1953,8 +1980,12 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   context_->PSSetShaderResources(0, 32, null_srvs);
   context_->OMSetRenderTargets(4, rtvs, dsv);
   bound_samples_ = bound_depth_ ? bound_depth_->samples : 1;
+  if (bound_depth_) bound_depth_->single_stale = true;
   for (auto* c : bound_color_)
-    if (c) bound_samples_ = c->samples;
+    if (c) {
+      bound_samples_ = c->samples;
+      c->single_stale = true;
+    }
 
   // Geometry.
   D3D11_PRIMITIVE_TOPOLOGY topology;
@@ -2557,23 +2588,39 @@ void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11
 
 // MSAA: what a resolve reads from a multisampled target, refreshed at each call: color is the
 // average of the samples (ResolveSubresource), depth sample 0 as a 32-bit float texture.
-ID3D11ShaderResourceView* RendererImpl::SingleSampleSrv(RenderTarget& rt) {
+// With part, only that rectangle of a color target is brought up to date; the copy stays stale.
+ID3D11ShaderResourceView* RendererImpl::SingleSampleSrv(RenderTarget& rt, const D3D11_RECT* part) {
   if (rt.samples <= 1) return rt.srv.get();
+  static const bool no_reuse = std::getenv("COPA_NO_SINGLE_REUSE") != nullptr;  // A/B
+  if (rt.single && !rt.single_stale && rt.single_epoch == tile_depth_clear_epoch_ && !no_reuse) {
+    ++single_reused_;
+    return rt.single_srv.get();
+  }
+  part = !rt.depth && blit_color_ms_ps_ ? part : nullptr;
+  if (!part) {
+    ++single_copied_;
+    rt.single_stale = false;
+    rt.single_epoch = tile_depth_clear_epoch_;
+  }
   D3D11_TEXTURE2D_DESC td;
   rt.texture->GetDesc(&td);
   const DXGI_FORMAT format = td.Format;
   if (!rt.single) {
     td.SampleDesc = {1, 0};
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    if (rt.depth) {
-      td.Format = DXGI_FORMAT_R32_FLOAT;
-      td.BindFlags |= D3D11_BIND_RENDER_TARGET;
-    }
+    td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    if (rt.depth) td.Format = DXGI_FORMAT_R32_FLOAT;
     if (FAILED(device_->CreateTexture2D(&td, nullptr, rt.single.put()))) return nullptr;
     device_->CreateShaderResourceView(rt.single.get(), nullptr, rt.single_srv.put());
-    if (rt.depth) device_->CreateRenderTargetView(rt.single.get(), nullptr, rt.single_rtv.put());
+    device_->CreateRenderTargetView(rt.single.get(), nullptr, rt.single_rtv.put());
   }
-  if (rt.depth) {
+  if (part) {
+    ++rect_resolves_;
+    D3D11_VIEWPORT vp{float(part->left), float(part->top), float(part->right - part->left),
+                      float(part->bottom - part->top), 0, 1};
+    BlitTo(rt.single_rtv.get(), td.Width, td.Height, vp, rt.srv.get(), 1, 1, 0, 0, 1, 1, false, false, true,
+           blit_color_ms_ps_.get());
+  } else if (rt.depth) {
     D3D11_VIEWPORT vp{0, 0, float(td.Width), float(td.Height), 0, 1};
     BlitTo(rt.single_rtv.get(), td.Width, td.Height, vp, rt.srv.get(), 1, 1, 0, 0, 1, 1, true, false, true,
            blit_depth_ms_ps_.get());
@@ -2633,13 +2680,6 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
     default: return;  // host layout differs from the guest one
   }
   if (r.format == 63) return;  // 7e3 float stored as half on the host
-  // Internal resolution: everything below works on a guest-size copy of the result.
-  ID3D11Texture2D* source = r.texture.get();
-  if (r.scale != 1.0f) {
-    source = GuestSizeCopy(r, dest_base & 0x1FFFFFFF, std::max(x, 0), std::max(y, 0), w, h);
-    if (!source) return;
-    source->GetDesc(&td);
-  }
   const bool pack4444 = r.format == 15 && td.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
   if (pack4444) bpp = 2;
   x = std::max(x, 0);
@@ -2670,7 +2710,7 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
     if (!od.cpu_polled) {
       // Tiled frames resolve one destination in several rectangles: keep their union.
       int32_t x0 = x, y0 = y, x1 = x + w, y1 = y + h;
-      if (od.dirty && od.texture.get() == source) {
+      if (od.dirty && od.texture.get() == r.texture.get()) {
         x0 = std::min(x0, od.x);
         y0 = std::min(y0, od.y);
         x1 = std::max(x1, od.x + od.w);
@@ -2684,8 +2724,14 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
       }
       if (end > first) {
         od.texture.reset();
-        source->AddRef();
-        od.texture.p = source;
+        od.srv.reset();
+        r.texture.get()->AddRef();
+        od.texture.p = r.texture.get();
+        r.srv.get()->AddRef();
+        od.srv.p = r.srv.get();
+        od.width = r.width;
+        od.height = r.height;
+        od.scale = r.scale;
         od.dest_base = base;
         od.dest_pitch = dest_pitch;
         od.endian = endian;
@@ -2721,6 +2767,13 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
   }
   if (steady && hist.queued_frame != frame_ && frame_ - hist.queued_frame < 60) return;
   hist.queued_frame = frame_;
+  // Internal resolution: everything below works on a guest-size copy of the result.
+  ID3D11Texture2D* source = r.texture.get();
+  if (r.scale != 1.0f) {
+    source = GuestSizeCopy(r, dest_base & 0x1FFFFFFF, x, y, w, h);
+    if (!source) return;
+    source->GetDesc(&td);
+  }
   Com<ID3D11Texture2D> staging;
   for (auto it = staging_pool_.begin(); it != staging_pool_.end(); ++it) {
     D3D11_TEXTURE2D_DESC sd;
@@ -2755,20 +2808,33 @@ bool RendererImpl::ProtectOnDemand(const OnDemandWriteBack& od, DWORD protect) {
   return any;
 }
 
-// Stores the latest result of an on-demand destination now (stalls on the GPU). Called from the
-// CPU thread that touched it, hence the multithread-protected immediate context.
+// Stores the latest result of an on-demand destination now (stalls on the GPU). Called with the
+// renderer's API lock held, also from the CPU thread that touched the memory.
 void RendererImpl::StoreOnDemand(OnDemandWriteBack& od) {
   std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
   if (!od.dirty || !od.texture) return;
+  ID3D11Texture2D* source = od.texture.get();
+  if (od.scale != 1.0f) {
+    ResolvedTexture r;
+    r.width = od.width;
+    r.height = od.height;
+    r.scale = od.scale;
+    r.texture.p = od.texture.p;
+    r.srv.p = od.srv.p;
+    source = GuestSizeCopy(r, od.dest_base, od.x, od.y, od.w, od.h);
+    r.texture.p = nullptr;  // borrowed from od
+    r.srv.p = nullptr;
+    if (!source) return;
+  }
   D3D11_TEXTURE2D_DESC td;
-  od.texture->GetDesc(&td);
+  source->GetDesc(&td);
   D3D11_TEXTURE2D_DESC sd{UINT(od.w), UINT(od.h), 1, 1, td.Format, {1, 0}, D3D11_USAGE_STAGING, 0,
                           D3D11_CPU_ACCESS_READ, 0};
   Com<ID3D11Texture2D> staging;
   D3D11_MAPPED_SUBRESOURCE m;
   if (SUCCEEDED(device_->CreateTexture2D(&sd, nullptr, staging.put()))) {
     D3D11_BOX box{UINT(od.x), UINT(od.y), 0, UINT(od.x + od.w), UINT(od.y + od.h), 1};
-    context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, od.texture.get(), 0, &box);
+    context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source, 0, &box);
     if (SUCCEEDED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
       StoreTiled(static_cast<const uint8_t*>(m.pData), m.RowPitch, od.dest_base, od.dest_pitch, od.endian, od.bpp,
                  od.x, od.y, od.w, od.h, od.pack4444);
@@ -2794,6 +2860,7 @@ void RendererImpl::ExpireOnDemand() {
     ProtectOnDemand(od, PAGE_READWRITE);
     od.protected_pages = false;
     od.texture.reset();
+    od.srv.reset();
   }
 }
 
@@ -2805,16 +2872,28 @@ bool RendererImpl::OnDemandStored(uint32_t base, uint64_t guest_hash) {
   return it != ondemand_.end() && it->second.has_stored_hash && it->second.stored_hash == guest_hash;
 }
 
+bool RendererImpl::OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address) {
+  if (!od.protected_pages) return false;
+  for (uint32_t view : {0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    uintptr_t first = reinterpret_cast<uintptr_t>(GuestPtr(membase_, view | od.first_page));
+    if (host_address >= first && host_address < first + (od.end_page - od.first_page)) return true;
+  }
+  return false;
+}
+
 bool RendererImpl::HandleOnDemandFault(uintptr_t host_address) {
+  // Most faults are the memory system's own write watches: they must not wait for the renderer.
+  {
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    bool mine = false;
+    for (auto& [base, od] : ondemand_) mine |= OnDemandCovers(od, host_address);
+    if (!mine) return false;
+  }
+  // The store draws and copies with the immediate context, so it waits its turn like any API call.
+  ApiLock api(ApiMutex());
   std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
   for (auto& [base, od] : ondemand_) {
-    if (!od.protected_pages) continue;
-    bool inside = false;
-    for (uint32_t view : {0xA0000000u, 0xC0000000u, 0xE0000000u}) {
-      uintptr_t first = reinterpret_cast<uintptr_t>(GuestPtr(membase_, view | od.first_page));
-      inside |= host_address >= first && host_address < first + (od.end_page - od.first_page);
-    }
-    if (!inside) continue;
+    if (!OnDemandCovers(od, host_address)) continue;
     StoreOnDemand(od);  // through the physical view, before other threads see the pages open
     ProtectOnDemand(od, PAGE_READWRITE);
     od.protected_pages = false;
@@ -2826,10 +2905,11 @@ bool RendererImpl::HandleOnDemandFault(uintptr_t host_address) {
     if (od.close_faults >= 3) {
       od.cpu_polled = true;
       od.texture.reset();
+      od.srv.reset();
     }
     return true;
   }
-  return false;
+  return true;  // another thread stored it first
 }
 
 // Stores rows of resolved texels (host order) at their tiled guest locations, in the copy endian.
@@ -3170,8 +3250,19 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
       bool swap = !src->depth && src->format <= 1 && (dest_format == 6 || dest_format == 62 || dest_format == 15) &&
                   req.dest_red_blue_swap != 0;
       dst->bgra = swap;
-      BlitTo(dst->rtv.get(), dst->width, dst->height, vp, SingleSampleSrv(*src), sw, sh, x0 / sw, y0 / sh,
-             x1 / sw, y1 / sh, src->depth, swap);
+      // The post effects draw 128x128 targets inside the 4K surface. Averaging just that rectangle
+      // replaces a resolve of the whole surface per target.
+      static const bool no_rect_resolve = std::getenv("COPA_NO_RECT_RESOLVE") != nullptr;  // A/B
+      D3D11_RECT part{};
+      const bool small_rect = src->samples > 1 && !src->depth && !no_rect_resolve &&
+                         uint64_t(x1 - x0) * uint64_t(y1 - y0) * 4 <= uint64_t(src->width) * uint64_t(src->height);
+      if (small_rect) {
+        // One texel more on each side: the blit below filters.
+        part = ScaledRect(std::max(x0 - 1, 0), std::max(y0 - 1, 0), std::min<int32_t>(x1 + 1, src->width),
+                          std::min<int32_t>(y1 + 1, src->height), src->scale);
+      }
+      BlitTo(dst->rtv.get(), dst->width, dst->height, vp, SingleSampleSrv(*src, small_rect ? &part : nullptr), sw, sh,
+             x0 / sw, y0 / sh, x1 / sw, y1 / sh, src->depth, swap);
       static const bool writeback = std::getenv("COPA_NO_RESOLVE_WRITEBACK") == nullptr;
       if (writeback)
         QueueWriteBack(*dst, dest_base, dest_pitch,
@@ -3248,6 +3339,7 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
     }
     D3D11_RECT r = ScaledRect(x0, y0, x1, y1, src->scale);
     context1_->ClearView(src->rtv.get(), rgba, &r, 1);
+    src->single_stale = true;
   }
   if (clear_depth) {
     uint32_t info = dev.reg(0x2002);
@@ -3272,6 +3364,7 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
         tile_depth_clear_.area += area;
         if (tile_depth_clear_.area >= uint64_t(pitch) * height) FlushTileDepthClear();
       } else {
+        d->single_stale = true;
         context_->ClearDepthStencilView(d->dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, UINT8(dv & 0xFF));
       }
     }
@@ -3303,6 +3396,7 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
     r.clear();
     for (uint32_t k = 0; k < rect_count; ++k)
       r.push_back(ScaledRect(rects[k * 4], rects[k * 4 + 1], rects[k * 4 + 2], rects[k * 4 + 3], rt->scale));
+    rt->single_stale = true;
     if (!r.empty() && context1_)
       context1_->ClearView(rt->rtv.get(), rgba, r.data(), UINT(r.size()));
     else
@@ -3313,6 +3407,7 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
     if (auto* d = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
       // Depth-stencil views cannot be cleared per rectangle in D3D11; rectangles that
       // cover less than the surface are rare for depth and cleared fully.
+      d->single_stale = true;
       context_->ClearDepthStencilView(
           d->dsv.get(), (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0),
           std::clamp(z, 0.0f, 1.0f), s);
@@ -3557,6 +3652,11 @@ void RendererImpl::Present(const uint8_t* fetch) {
   }
   // MSAA likewise: targets of another sample count are recreated as they are used.
   UpdateMsaa();
+  if (frame_ % 1200 == 0 && single_copied_ + single_reused_) {
+    REXLOG_INFO("copa msaa single-sample copies: {} made, {} reused, {} rectangles", single_copied_, single_reused_,
+                rect_resolves_);
+    single_copied_ = single_reused_ = rect_resolves_ = 0;
+  }
   auto present_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - present_start).count();
   static int slow_logs = 0;
@@ -3600,14 +3700,6 @@ static RendererImpl& Impl() {
   static RendererImpl impl;
   return impl;
 }
-
-// The D3D11 immediate context is single-threaded; CPU waits (FlushWriteBacks) can come from
-// threads other than the one issuing the draws.
-static std::recursive_mutex& ApiMutex() {
-  static std::recursive_mutex m;
-  return m;
-}
-using ApiLock = std::lock_guard<std::recursive_mutex>;
 
 Renderer& Renderer::Get() {
   static Renderer r;
