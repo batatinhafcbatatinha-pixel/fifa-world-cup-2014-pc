@@ -178,6 +178,7 @@ class XmaContext {
       if (remaining_subframes_ == 0) return;
       Consume(&data);
       data.output_buffer_write_offset = out_write_ / kOutputBytesPerBlock;
+      if (out_capacity_ && out_used_ >= out_capacity_) data.output_buffer_valid = 0;
       StoreMerged(data, initial, ptr);
       return;
     }
@@ -203,7 +204,10 @@ class XmaContext {
       idle = (free_blocks_ == free_before && remaining_subframes_ == remaining_before) ? idle + 1 : 0;
     }
     data.output_buffer_write_offset = out_write_ / kOutputBytesPerBlock;
-    if (out_write_ == out_read_ && out_used_ == 0) data.output_buffer_valid = 0;
+    // write == read is ambiguous: the voice reader (sub_83919870) takes it as empty while the
+    // buffer is valid and as full once it is not, so a full ring must clear the flag. Left
+    // set, the reader saw no data, timed out and played silence over everything decoded.
+    if (out_capacity_ && out_used_ >= out_capacity_) data.output_buffer_valid = 0;
     StoreMerged(data, initial, ptr);
   }
 
