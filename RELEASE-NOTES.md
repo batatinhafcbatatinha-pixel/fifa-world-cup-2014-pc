@@ -1,5 +1,9 @@
 Work-in-progress source kit (pre-release): no game, no XEX, no generated code, no game executable; `Setup.exe` is our installer and launcher. Bring your own Xbox 360 Brazil (En,Pt) disc.
 
+**v0.2.6**
+
+- `Setup.exe` now finds this pre-release on its own (v0.2.5's looked only for full releases and could not download the kit). README links point to the release list, since GitHub's "latest" link skips pre-releases.
+
 **v0.2.5**
 
 - **`Setup.exe`**: download it alone and run it. It fetches this repository's source, shows on its *Dependencies* tab what your PC has and what is missing (Python, C++ Build Tools, LLVM/CMake/Ninja, your game files, the built game) with the space each part needs, installs each part or everything, and builds the game. Afterwards it is the launcher: *Play*, and *PC settings* with the same options as the F1 menu, saved before the game starts. Dark and light themes (the default follows Windows). It is built by GitHub from `tools/launcher`; nothing from the game is in it. Windows may warn because it is not signed.
